@@ -1,0 +1,3 @@
+saver:
+  snapshot_dir: checkpoints
+  use_tb: true

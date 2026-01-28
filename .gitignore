@@ -1,0 +1,28 @@
+# datasets / generated outputs
+data/
+exps/**/checkpoints/
+exps/**/log/
+checkpoints/
+# weights / exported models
+pretrained/
+*.pth
+*.pt
+*.onnx
+
+# logs / stats
+*.log
+*.csv
+*.json
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+# editor / notebook
+.ipynb_checkpoints/
+.vscode/
+# env
+.venv/
+venv/
+.env
+VOCtrainval_11-May-2012.tar
