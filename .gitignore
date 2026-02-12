@@ -26,3 +26,6 @@ __pycache__/
 venv/
 .env
 VOCtrainval_11-May-2012.tar
+
+# W&B local
+wandb/
