@@ -156,157 +156,190 @@ class RandomFlip(object):
         return in_image, in_label
 
 
-# # # # # # # # # # # # # # # # # # # # # # # # 
+# # # # # # # # # # # # # # # # # # # # # # # #
 # # # 2. Strong Augmentation for image only
-# # # # # # # # # # # # # # # # # # # # # # # # 
+# # # # # # # # # # # # # # # # # # # # # # # #
 
-def img_aug_identity(img, scale=None):
-    return img
+import math
 
-
-def img_aug_autocontrast(img, scale=None):
-    return ImageOps.autocontrast(img)
-
-
-def img_aug_equalize(img, scale=None):
-    return ImageOps.equalize(img)
+def _ret(img_out, t, return_param: bool):
+    if return_param:
+        return img_out, float(t) if t is not None else float("nan")
+    return img_out
 
 
-def img_aug_invert(img, scale=None):
-    return ImageOps.invert(img)
+def img_aug_identity(img, scale=None, return_param=False):
+    return _ret(img, float("nan"), return_param)
 
 
-def img_aug_blur(img, scale=[0.1, 2.0]):
+def img_aug_autocontrast(img, scale=None, return_param=False):
+    out = ImageOps.autocontrast(img)
+    return _ret(out, float("nan"), return_param)
+
+
+def img_aug_equalize(img, scale=None, return_param=False):
+    out = ImageOps.equalize(img)
+    return _ret(out, float("nan"), return_param)
+
+
+def img_aug_invert(img, scale=None, return_param=False):
+    out = ImageOps.invert(img)
+    return _ret(out, float("nan"), return_param)
+
+
+def img_aug_blur(img, scale=[0.1, 2.0], return_param=False):
     assert scale[0] < scale[1]
-    sigma = np.random.uniform(scale[0], scale[1])
-    # print(f"sigma:{sigma}")
-    return img.filter(ImageFilter.GaussianBlur(radius=sigma))
+    sigma = np.random.uniform(scale[0], scale[1])  # t = sigma
+    out = img.filter(ImageFilter.GaussianBlur(radius=sigma))
+    return _ret(out, sigma, return_param)
 
 
-def img_aug_contrast(img, scale=[0.05, 0.95]):
+def img_aug_contrast(img, scale=[0.05, 0.95], return_param=False):
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    v = max_v - v
-    # # print(f"final:{v}")
-    # v = np.random.uniform(scale[0], scale[1])
-    return ImageEnhance.Contrast(img).enhance(v)
+    v = float(max_v - min_v) * random.random()
+    v = max_v - v  # t = v
+    out = ImageEnhance.Contrast(img).enhance(v)
+    return _ret(out, v, return_param)
 
 
-def img_aug_brightness(img, scale=[0.05, 0.95]):
+def img_aug_brightness(img, scale=[0.05, 0.95], return_param=False):
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    v = max_v - v
-    # print(f"final:{v}")
-    return ImageEnhance.Brightness(img).enhance(v)
+    v = float(max_v - min_v) * random.random()
+    v = max_v - v  # t = v
+    out = ImageEnhance.Brightness(img).enhance(v)
+    return _ret(out, v, return_param)
 
 
-def img_aug_color(img, scale=[0.05, 0.95]):
+def img_aug_color(img, scale=[0.05, 0.95], return_param=False):
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    v = max_v - v
-    # print(f"final:{v}")
-    return ImageEnhance.Color(img).enhance(v)
+    v = float(max_v - min_v) * random.random()
+    v = max_v - v  # t = v
+    out = ImageEnhance.Color(img).enhance(v)
+    return _ret(out, v, return_param)
 
 
-def img_aug_sharpness(img, scale=[0.05, 0.95]):
+def img_aug_sharpness(img, scale=[0.05, 0.95], return_param=False):
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    v = max_v - v
-    # print(f"final:{v}")
-    return ImageEnhance.Sharpness(img).enhance(v)
+    v = float(max_v - min_v) * random.random()
+    v = max_v - v  # t = v
+    out = ImageEnhance.Sharpness(img).enhance(v)
+    return _ret(out, v, return_param)
 
 
-def img_aug_hue(img, scale=[0, 0.5]):
+def img_aug_hue(img, scale=[0, 0.5], return_param=False):
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    v += min_v
-    if np.random.random() < 0.5:
-        hue_factor = -v
-    else:
-        hue_factor = v
-    # print(f"Final-V:{hue_factor}")
+    v_mag = float(max_v - min_v) * random.random()
+    v_mag += min_v
+    hue_factor = -v_mag if (np.random.random() < 0.5) else v_mag  # t = hue_factor
+
     input_mode = img.mode
     if input_mode in {"L", "1", "I", "F"}:
-        return img
-    h, s, v = img.convert("HSV").split()
+        # ảnh grayscale thì hue không áp dụng được
+        return _ret(img, hue_factor, return_param)
+
+    h, s, v_chan = img.convert("HSV").split()
     np_h = np.array(h, dtype=np.uint8)
-    # uint8 addition take cares of rotation across boundaries
+
+    # uint8 addition takes care of rotation across boundaries
     with np.errstate(over="ignore"):
         delta = int(round(hue_factor * 255))
         np_h = (np_h.astype(np.int16) + delta) % 256
         np_h = np_h.astype(np.uint8)
-    h = Image.fromarray(np_h, "L")
-    img = Image.merge("HSV", (h, s, v)).convert(input_mode)
-    return img
+
+    h2 = Image.fromarray(np_h, "L")
+    out = Image.merge("HSV", (h2, s, v_chan)).convert(input_mode)
+    return _ret(out, hue_factor, return_param)
 
 
-def img_aug_posterize(img, scale=[4, 8]):
+def img_aug_posterize(img, scale=[4, 8], return_param=False):
+    # PIL posterize dùng "bits" (số bit giữ lại). bits càng nhỏ => càng mạnh
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    # print(min_v, max_v, v)
+    v = float(max_v - min_v) * random.random()
     v = int(np.ceil(v))
     v = max(1, v)
-    v = max_v - v
-    # print(f"final:{v}")
-    return ImageOps.posterize(img, v)
+    bits = max_v - v  # t = bits (discrete)
+    out = ImageOps.posterize(img, bits)
+    return _ret(out, bits, return_param)
 
 
-def img_aug_solarize(img, scale=[1, 256]):
+def img_aug_solarize(img, scale=[1, 256], return_param=False):
+    # threshold càng thấp => càng mạnh
     min_v, max_v = min(scale), max(scale)
-    v = float(max_v - min_v)*random.random()
-    # print(min_v, max_v, v)
+    v = float(max_v - min_v) * random.random()
     v = int(np.ceil(v))
     v = max(1, v)
-    v = max_v - v
-    # print(f"final:{v}")
-    return ImageOps.solarize(img, v)
+    thr = max_v - v  # t = thr (discrete threshold)
+    out = ImageOps.solarize(img, thr)
+    return _ret(out, thr, return_param)
 
-def get_augment_list(flag_using_wide=False):  
+
+def get_augment_list(flag_using_wide=False):
     if flag_using_wide:
         l = [
-        (img_aug_identity, None),
-        (img_aug_autocontrast, None),
-        (img_aug_equalize, None),
-        (img_aug_blur, [0.1, 2.0]),
-        (img_aug_contrast, [0.1, 1.8]),
-        (img_aug_brightness, [0.1, 1.8]),
-        (img_aug_color, [0.1, 1.8]),
-        (img_aug_sharpness, [0.1, 1.8]),
-        (img_aug_posterize, [2, 8]),
-        (img_aug_solarize, [1, 256]),
-        (img_aug_hue, [0, 0.5])
+            (1, img_aug_identity, None),
+            (2, img_aug_autocontrast, None),
+            (3, img_aug_equalize, None),
+            (4, img_aug_blur, [0.1, 2.0]),
+            (5, img_aug_contrast, [0.1, 1.8]),
+            (6, img_aug_brightness, [0.1, 1.8]),
+            (7, img_aug_color, [0.1, 1.8]),
+            (8, img_aug_sharpness, [0.1, 1.8]),
+            (9, img_aug_posterize, [2, 8]),
+            (10, img_aug_solarize, [1, 256]),
+            (11, img_aug_hue, [0, 0.5]),
         ]
     else:
         l = [
-            (img_aug_identity, None),
-            (img_aug_autocontrast, None),
-            (img_aug_equalize, None),
-            (img_aug_blur, [0.1, 2.0]),
-            (img_aug_contrast, [0.05, 0.95]),
-            (img_aug_brightness, [0.05, 0.95]),
-            (img_aug_color, [0.05, 0.95]),
-            (img_aug_sharpness, [0.05, 0.95]),
-            (img_aug_posterize, [4, 8]),
-            (img_aug_solarize, [1, 256]),
-            (img_aug_hue, [0, 0.5])
+            (1, img_aug_identity, None),
+            (2, img_aug_autocontrast, None),
+            (3, img_aug_equalize, None),
+            (4, img_aug_blur, [0.1, 2.0]),
+            (5, img_aug_contrast, [0.05, 0.95]),
+            (6, img_aug_brightness, [0.05, 0.95]),
+            (7, img_aug_color, [0.05, 0.95]),
+            (8, img_aug_sharpness, [0.05, 0.95]),
+            (9, img_aug_posterize, [4, 8]),
+            (10, img_aug_solarize, [1, 256]),
+            (11, img_aug_hue, [0, 0.5]),
         ]
     return l
 
 
 class strong_img_aug:
     def __init__(self, num_augs, flag_using_random_num=False):
-        assert 1<= num_augs <= 11
-        self.n = num_augs
+        assert 1 <= num_augs <= 11
+        self.n = num_augs  # số op tối đa (cũng là độ dài pad output)
         self.augment_list = get_augment_list(flag_using_wide=False)
         self.flag_using_random_num = flag_using_random_num
-    
-    def __call__(self, img):
+
+    def __call__(self, img, return_info: bool = False):
+        # chọn số op thực sự sẽ áp dụng
         if self.flag_using_random_num:
-            max_num = np.random.randint(1, high=self.n + 1)
+            max_num = np.random.randint(1, high=self.n + 1)  # 1..n
         else:
-            max_num =self.n
+            max_num = self.n
+
+        # chọn ops: mỗi phần tử là (k_id, op_fn, scales)
         ops = random.choices(self.augment_list, k=max_num)
-        for op, scales in ops:
-            # print("="*20, str(op))
-            img = op(img, scales)
+
+        k_ids = []
+        t_vals = []
+
+        for k_id, op_fn, scales in ops:
+            if return_info:
+                img, t = op_fn(img, scales, return_param=True)
+                k_ids.append(int(k_id))
+                t_vals.append(float(t))
+            else:
+                img = op_fn(img, scales, return_param=False)
+
+        if return_info:
+            # pad cho đủ length = self.n để DataLoader stack được thành [B, n]
+            pad_len = self.n - len(k_ids)
+            if pad_len > 0:
+                k_ids.extend([0] * pad_len)                 # 0 = padding
+                t_vals.extend([float("nan")] * pad_len)     # NaN = padding
+
+            return img, k_ids, t_vals
+
         return img

@@ -23,6 +23,59 @@ from augseg.utils.utils import load_state, AverageMeter, intersectionAndUnion
 from augseg.dataset.augs_ALIA import cut_mix_label_adaptive
 from augseg.utils.loss_helper import compute_unsupervised_loss_by_threshold
 
+# ---------------- Aa op mapping + strength normalize (0..1) ----------------
+AA_OPS = {
+    1: "identity",
+    2: "autocontrast",
+    3: "equalize",
+    4: "blur",
+    5: "contrast",
+    6: "brightness",
+    7: "color",
+    8: "sharpness",
+    9: "posterize",
+    10: "solarize",
+    11: "hue",
+}
+
+def aa_strength(k_id: int, t: float) -> float:
+    """
+    Chuẩn hoá intensity về [0,1] (0=nhẹ, 1=mạnh).
+    Giải quyết vấn đề: thang đo khác nhau + đảo chiều (solarize/posterize).
+    """
+    import math
+    if t is None or (isinstance(t, float) and math.isnan(t)):
+        return float("nan")
+
+    # blur sigma: càng lớn càng mạnh
+    if k_id == 4:
+        return float((t - 0.1) / (2.0 - 0.1))
+
+    # contrast/brightness/color/sharpness: factor (<=1) càng nhỏ càng mạnh
+    if k_id in (5, 6, 7, 8):
+        vmin, vmax = 0.05, 0.95
+        v = max(vmin, min(vmax, float(t)))
+        return float((1.0 - v) / (1.0 - vmin))
+
+    # posterize bits: bits càng thấp càng mạnh
+    if k_id == 9:
+        b = int(round(float(t)))
+        b = max(1, min(8, b))
+        return float((8 - b) / 7.0)
+
+    # solarize threshold: threshold càng thấp càng mạnh
+    if k_id == 10:
+        thr = int(round(float(t)))
+        thr = max(1, min(256, thr))
+        return float((256 - thr) / 255.0)
+
+    # hue: |hue| càng lớn càng mạnh
+    if k_id == 11:
+        v = max(-0.5, min(0.5, float(t)))
+        return float(abs(v) / 0.5)
+
+    return float("nan")
+
 def main(in_args):
     args = in_args
     if args.seed is not None:
@@ -31,6 +84,10 @@ def main(in_args):
         # set_random_seed(args.seed)
     cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
     rank, word_size = setup_distributed(port=args.port)
+
+    # ✅ đặt ở đây
+    if rank != 0:
+        os.environ["WANDB_MODE"] = "disabled"
     
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     torch.cuda.set_device(local_rank)
@@ -58,13 +115,31 @@ def main(in_args):
     if rank == 0:
         logger.info("{}".format(pprint.pformat(cfg)))
         if flag_use_tb:
-            tb_logger = SummaryWriter(
-                osp.join(cfg["log_path"], "events_seg",curr_timestr)
-            )
+            tb_logger = SummaryWriter(osp.join(cfg["log_path"], "events_seg", curr_timestr))
         else:
             tb_logger = None
     else:
         tb_logger = None
+
+    # ---------------- W&B (wandb) ----------------
+    wandb_run = None
+    use_wandb = cfg.get("wandb", {}).get("enable", False)
+
+    if use_wandb:
+        if rank != 0:
+            # DDP: chỉ rank0 log, rank khác tắt để khỏi spam nhiều runs
+            os.environ["WANDB_MODE"] = "disabled"
+        else:
+            import wandb
+            wandb_run = wandb.init(
+                project=cfg.get("wandb", {}).get("project", "AugsegResearch"),
+                entity=cfg.get("wandb", {}).get("entity", None),
+                name=cfg.get("wandb", {}).get("name", curr_timestr),
+                config=cfg,
+                dir=cfg["log_path"],
+                settings=wandb.Settings(start_method="thread"),
+            )
+
     # make sure all folders and csv handler are correctly created on rank ==0.
     dist.barrier(device_ids=[local_rank])
 
@@ -179,7 +254,8 @@ def main(in_args):
             epoch,
             tb_logger,
             logger,
-            cfg
+            cfg,
+            wandb_run,   # <-- thêm dòng này
         )
 
         # Validation and store checkpoint
@@ -240,7 +316,20 @@ def main(in_args):
                 prec_stu * 100, prec_tea * 100, best_prec_stu * 100, best_epoch_stu, best_prec * 100, best_epoch))
             if tb_logger is not None:
                 tb_logger.add_scalar("mIoU val", prec, epoch)
-    
+
+            if (rank == 0) and (wandb_run is not None):
+                global_step = int((epoch + 1) * len(train_loader_sup) - 1)
+                wandb_run.log({
+                    "val/miou_stu": float(prec_stu),
+                    "val/miou_tea": float(prec_tea),
+                    "epoch/loss_sup": float(res_loss_sup),
+                    "epoch/loss_unsup": float(res_loss_unsup),
+                    "meta/epoch": int(epoch + 1),
+                }, step=global_step)
+            
+    if (rank == 0) and (wandb_run is not None):
+        wandb_run.finish()
+
     if dist.is_available() and dist.is_initialized():
         dist.barrier(device_ids=[local_rank])
         dist.destroy_process_group()
@@ -261,11 +350,13 @@ def train(
     tb_logger,
     logger,
     cfg,
+    wandb_run=None,   # <-- thêm
 ):
 
     local_rank = torch.cuda.current_device()
     ema_decay_origin = cfg["net"]["ema_decay"]
     rank, world_size = dist.get_rank(), dist.get_world_size()
+    log_every = int(cfg.get("wandb", {}).get("log_every", 50))
     flag_extra_weak = cfg["trainer"]["unsupervised"].get("flag_extra_weak", False)
     model.train()
     
@@ -293,8 +384,23 @@ def train(
     model_teacher.eval()
     for step in range(len(loader_l)):
         batch_start = time.time()
+        # --------- init per-iter stats for wandb (tránh dính iter trước) ---------
+        ar_triggered = 0
+        ar_applied = 0
+        ar_area_ratio_est = float("nan")
+
+        u_entropy_mean = float("nan")
+        u_maxprob_mean = float("nan")
+        u_maxprob_p10 = float("nan")
+        u_maxprob_p50 = float("nan")
+        u_maxprob_p90 = float("nan")
+        u_pseudo_ratio_mean = float("nan")
 
         i_iter = epoch * len(loader_l) + step # total iters till now
+        # log schedule (đúng y hệt block W&B phía dưới)
+        do_log_now = (wandb_run is not None) and (rank == 0) and (
+            (i_iter % log_every == 0) or (step == len(loader_l) - 1)
+        )
         lr = lr_scheduler.get_lr()
         learning_rates.update(lr[0])
         lr_scheduler.step() # lr is updated at the iteration level
@@ -313,7 +419,17 @@ def train(
             print("label min/max:", label_l.min().item(), label_l.max().item())
             raise RuntimeError("Out-of-range labels in supervised mask")
 
-        _, image_u_weak, image_u_aug, _ = next(loader_u_iter)
+        batch_u = next(loader_u_iter)
+
+        # batch_u có thể là:
+        # - cũ: (idx, weak, strong, label)
+        # - mới: (idx, weak, strong, label, k_ids, t_vals)
+        if len(batch_u) == 4:
+            _, image_u_weak, image_u_aug, _ = batch_u
+            k_ids, t_vals = None, None
+        else:
+            _, image_u_weak, image_u_aug, _, k_ids, t_vals = batch_u
+
         image_u_weak = image_u_weak.cuda(local_rank, non_blocking=True)
         image_u_aug  = image_u_aug.cuda(local_rank, non_blocking=True)
     
@@ -351,22 +467,61 @@ def train(
                 confidence = confidence * logits_u_aug
                 confidence = confidence.mean(dim=[1,2])  # 1*C
                 confidence = confidence.cpu().numpy().tolist()
+                # effect stats: entropy mean (teacher on weak)
+                u_entropy_mean = float(entropy.detach().mean().item())
+
                 # confidence = logits_u_aug.ge(p_threshold).float().mean(dim=[1,2]).cpu().numpy().tolist()
                 del pred_u
             model.train()
             
-            # 2. apply cutmix
+            # 2. apply cutmix (Ar) + log flags
+            use_cutmix = cfg["trainer"]["unsupervised"].get("use_cutmix", False)
             trigger_prob = cfg["trainer"]["unsupervised"].get("use_cutmix_trigger_prob", 1.0)
-            if np.random.uniform(0, 1) < trigger_prob and cfg["trainer"]["unsupervised"].get("use_cutmix", False):
-                if cfg["trainer"]["unsupervised"].get("use_cutmix_adaptive", False):
+
+            rnd = np.random.uniform(0, 1)
+            ar_triggered = int(rnd < trigger_prob)
+            ar_applied = int(ar_triggered and use_cutmix)
+
+            if ar_applied:
+                # estimate area ratio CHỈ để log -> chỉ tính khi do_log_now
+                label_u_before = None
+                if do_log_now:
+                    label_u_before = label_u_aug.clone()                    
+
+                if cfg["trainer"]["unsupervised"].get("use_cutmix_adaptive", False):                                    
                     image_u_aug, label_u_aug, logits_u_aug = cut_mix_label_adaptive(
-                            image_u_aug,
-                            label_u_aug,
-                            logits_u_aug, 
-                            image_l,
-                            label_l, 
-                            confidence
-                        )
+                        image_u_aug, label_u_aug, logits_u_aug,
+                        image_l, label_l, confidence
+                    )
+                else:
+                    image_u_aug, label_u_aug, logits_u_aug = cut_mix_label_adaptive(
+                        image_u_aug, label_u_aug, logits_u_aug,
+                        image_l, label_l, confidence
+                    )
+
+                if label_u_before is not None:
+                    ar_area_ratio_est = (label_u_aug != label_u_before).float().mean().item()
+                    del label_u_before
+
+
+            # effect stats: maxprob quantiles + pseudo ratio (sau cutmix nếu có)
+            # CHỈ tính khi thật sự log để tránh chậm (torch.quantile khá tốn)
+            if do_log_now:
+                mp = logits_u_aug.detach()           # [B,H,W] max prob
+                mp_flat = mp.reshape(-1)
+
+                u_maxprob_mean = float(mp_flat.mean().item())
+                q = torch.quantile(
+                    mp_flat,
+                    torch.tensor([0.1, 0.5, 0.9], device=mp.device)
+                )
+                u_maxprob_p10 = float(q[0].item())
+                u_maxprob_p50 = float(q[1].item())
+                u_maxprob_p90 = float(q[2].item())
+
+                u_pseudo_ratio_mean = float((mp >= p_threshold).float().mean().item())
+
+
 
             # 3. forward concate labeled + unlabeld into student networks
             num_labeled = len(image_l)
@@ -461,11 +616,93 @@ def train(
                     lr=learning_rates,
                 )
             )
+
             if tb_logger is not None:
                 tb_logger.add_scalar("lr", learning_rates.avg, i_iter)
                 tb_logger.add_scalar("Sup Loss", sup_losses.avg, i_iter)
                 tb_logger.add_scalar("Uns Loss", uns_losses.avg, i_iter)
                 tb_logger.add_scalar("High ratio", meter_high_pseudo_ratio.avg, i_iter)
+
+        # ---------- W&B log: log theo iter ----------
+        if (wandb_run is not None) and (rank == 0):
+            do_log = (i_iter % log_every == 0) or (step == len(loader_l) - 1)
+            if do_log:
+                log_dict = {
+                    # core training
+                    "iter/sup_loss": float(sup_losses.val),
+                    "iter/uns_loss": float(uns_losses.val),
+                    "iter/pseudo_high_ratio": float(meter_high_pseudo_ratio.val),
+                    "iter/lr": float(learning_rates.val),
+                    "meta/epoch": int(epoch),
+                    "meta/iter_in_epoch": int(step),
+
+                    # Ar (CutMix)
+                    "ar/triggered": int(ar_triggered),
+                    "ar/applied": int(ar_applied),
+                    "ar/area_ratio_est": float(ar_area_ratio_est),
+
+                    # Effect (pseudo quality)
+                    "u/entropy_mean": float(u_entropy_mean),
+                    "u/maxprob_mean": float(u_maxprob_mean),
+                    "u/maxprob_p10": float(u_maxprob_p10),
+                    "u/maxprob_p50": float(u_maxprob_p50),
+                    "u/maxprob_p90": float(u_maxprob_p90),
+                    "u/pseudo_ratio_mean": float(u_pseudo_ratio_mean),
+                }
+
+                # -------- Aa (photometric) --------
+                if (k_ids is not None) and (t_vals is not None):
+                    k_np = k_ids.detach().cpu().numpy()
+                    t_np = t_vals.detach().cpu().numpy()
+
+                    # ops per image
+                    log_dict["aa/ops_per_image"] = float((k_np > 0).sum(axis=1).mean())
+
+                    # op_rate: thay cho k_count tuyệt đối
+                    total_ops = max(int((k_np > 0).sum()), 1)
+
+                    for kid in range(1, 12):
+                        op_name = AA_OPS.get(kid, f"op{kid}")
+                        m = (k_np == kid)
+                        cnt = int(m.sum())
+                        log_dict[f"aa/op_rate/{op_name}"] = cnt / total_ops
+
+                        # t stats (raw) - dùng để check sampling range
+                        if cnt > 0:
+                            tv = t_np[m]
+                            # bỏ NaN nếu có
+                            tv = tv[np.isfinite(tv)]
+                            if tv.size > 0:
+                                log_dict[f"aa/t_mean/{op_name}"] = float(tv.mean())
+                                log_dict[f"aa/t_std/{op_name}"] = float(tv.std())
+
+                                # strength stats (0..1) - dùng để so cross-op và nghiên cứu
+                                sv = np.array([aa_strength(kid, float(x)) for x in tv], dtype=np.float32)
+                                sv = sv[np.isfinite(sv)]
+                                if sv.size > 0:
+                                    log_dict[f"aa/strength_mean/{op_name}"] = float(sv.mean())
+
+                    # drilldown text: 2 ảnh đầu
+                    def fmt_img(i):
+                        parts = []
+                        for kk, tt in zip(k_np[i].tolist(), t_np[i].tolist()):
+                            if kk <= 0:
+                                continue
+                            op = AA_OPS.get(int(kk), f"op{kk}")
+                            if np.isfinite(tt):
+                                s = aa_strength(int(kk), float(tt))
+                                parts.append(f"{op}(t={tt:.3g},s={s:.2f})")
+                            else:
+                                parts.append(f"{op}")
+                        return "[" + ", ".join(parts) + "]"
+
+                    if k_np.shape[0] >= 1:
+                        log_dict["aa/debug_img0"] = f"img0: {fmt_img(0)}"
+                    if k_np.shape[0] >= 2:
+                        log_dict["aa/debug_img1"] = f"img1: {fmt_img(1)}"
+
+                wandb_run.log(log_dict, step=int(i_iter))
+
     
     return sup_losses.avg, uns_losses.avg
 
