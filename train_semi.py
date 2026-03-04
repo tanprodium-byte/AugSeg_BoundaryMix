@@ -111,6 +111,7 @@ def main(in_args):
     else:
         logger, curr_timestr = None, ""
         csv_path = None
+    train_iter_csv = os.path.join(cfg["log_path"], f"train_iter_{curr_timestr}.csv")
     # tensorboard
     if rank == 0:
         logger.info("{}".format(pprint.pformat(cfg)))
@@ -256,6 +257,7 @@ def main(in_args):
             logger,
             cfg,
             wandb_run,   # <-- thêm dòng này
+            train_iter_csv=train_iter_csv,
         )
 
         # Validation and store checkpoint
@@ -351,6 +353,7 @@ def train(
     logger,
     cfg,
     wandb_run=None,   # <-- thêm
+    train_iter_csv=None
 ):
 
     local_rank = torch.cuda.current_device()
@@ -661,26 +664,62 @@ def train(
                     # op_rate: thay cho k_count tuyệt đối
                     total_ops = max(int((k_np > 0).sum()), 1)
 
+                    # strength mặc định cho các op không có tham số t
+                    AA_DEFAULT_PCT = {
+                        "identity": 0.0,
+                        "autocontrast": 100.0,
+                        "equalize": 100.0,
+                    }
+
                     for kid in range(1, 12):
                         op_name = AA_OPS.get(kid, f"op{kid}")
                         m = (k_np == kid)
                         cnt = int(m.sum())
+
+                        # op_rate vẫn giữ nếu bạn muốn
                         log_dict[f"aa/op_rate/{op_name}"] = cnt / total_ops
 
-                        # t stats (raw) - dùng để check sampling range
-                        if cnt > 0:
-                            tv = t_np[m]
-                            # bỏ NaN nếu có
-                            tv = tv[np.isfinite(tv)]
-                            if tv.size > 0:
-                                log_dict[f"aa/t_mean/{op_name}"] = float(tv.mean())
-                                log_dict[f"aa/t_std/{op_name}"] = float(tv.std())
+                        # ---- R1: LUÔN set 3 cột cho mọi op ----
+                        if cnt <= 0:
+                            # không dùng
+                            log_dict[f"aa/pct_mean/{op_name}"] = -1.0
+                            log_dict[f"aa/pct_max/{op_name}"] = -1.0
+                            log_dict[f"aa/count/{op_name}"] = 0
+                            # (optional) t_mean/t_std cho op không dùng: set -1 hoặc bỏ luôn
+                            continue
 
-                                # strength stats (0..1) - dùng để so cross-op và nghiên cứu
-                                sv = np.array([aa_strength(kid, float(x)) for x in tv], dtype=np.float32)
-                                sv = sv[np.isfinite(sv)]
-                                if sv.size > 0:
-                                    log_dict[f"aa/strength_mean/{op_name}"] = float(sv.mean())
+                        # dùng (có thể duplicate)
+                        log_dict[f"aa/count/{op_name}"] = cnt
+
+                        tv = t_np[m]
+                        tv = tv[np.isfinite(tv)]
+
+                        if tv.size > 0:
+                            # có t -> tính strength từ aa_strength
+                            sv = np.array([aa_strength(kid, float(x)) for x in tv], dtype=np.float32)
+                            sv = sv[np.isfinite(sv)]
+
+                            if sv.size > 0:
+                                sv_pct = sv * 100.0
+                                log_dict[f"aa/pct_mean/{op_name}"] = float(sv_pct.mean())
+                                log_dict[f"aa/pct_max/{op_name}"]  = float(sv_pct.max())
+                            else:
+                                # cực hiếm: có tv nhưng aa_strength ra NaN
+                                log_dict[f"aa/pct_mean/{op_name}"] = -1.0
+                                log_dict[f"aa/pct_max/{op_name}"]  = -1.0
+
+                            # (optional) nếu vẫn muốn giữ raw t để debug range:
+                            log_dict[f"aa/t_mean/{op_name}"] = float(tv.mean())
+                            log_dict[f"aa/t_std/{op_name}"]  = float(tv.std())
+
+                        else:
+                            # không có t (op bật/tắt) -> dùng default strength theo R1
+                            default_pct = AA_DEFAULT_PCT.get(op_name, 100.0)  # các op bật/tắt khác mặc định 100
+                            log_dict[f"aa/pct_mean/{op_name}"] = float(default_pct)
+                            log_dict[f"aa/pct_max/{op_name}"]  = float(default_pct)
+                            # (optional) t_mean/t_std: set -1 để thống nhất
+                            log_dict[f"aa/t_mean/{op_name}"] = -1.0
+                            log_dict[f"aa/t_std/{op_name}"]  = -1.0
 
                     # drilldown text: 2 ảnh đầu
                     def fmt_img(i):
@@ -702,6 +741,12 @@ def train(
                         log_dict["aa/debug_img1"] = f"img1: {fmt_img(1)}"
 
                 wandb_run.log(log_dict, step=int(i_iter))
+                if train_iter_csv is not None:
+                    df_row = pd.DataFrame([log_dict])
+                    if os.path.exists(train_iter_csv):
+                        df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
+                    else:
+                        df_row.to_csv(train_iter_csv, index=False)
 
     
     return sup_losses.avg, uns_losses.avg
