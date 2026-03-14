@@ -23,6 +23,214 @@ from augseg.utils.utils import load_state, AverageMeter, intersectionAndUnion
 from augseg.dataset.augs_ALIA import cut_mix_label_adaptive
 from augseg.utils.loss_helper import compute_unsupervised_loss_by_threshold
 
+# ---------------- Aa op mapping + strength normalize (0..1) ----------------
+AA_OPS = {
+    1: "identity",
+    2: "autocontrast",
+    3: "equalize",
+    4: "blur",
+    5: "contrast",
+    6: "brightness",
+    7: "color",
+    8: "sharpness",
+    9: "posterize",
+    10: "solarize",
+    11: "hue",
+}
+
+def aa_strength(k_id: int, t: float) -> float:
+    """
+    Chuẩn hoá intensity về [0,1] (0=nhẹ, 1=mạnh).
+    Giải quyết vấn đề: thang đo khác nhau + đảo chiều (solarize/posterize).
+    """
+    import math
+    if t is None or (isinstance(t, float) and math.isnan(t)):
+        return float("nan")
+
+    # blur sigma: càng lớn càng mạnh
+    if k_id == 4:
+        return float((t - 0.1) / (2.0 - 0.1))
+
+    # contrast/brightness/color/sharpness: factor (<=1) càng nhỏ càng mạnh
+    if k_id in (5, 6, 7, 8):
+        vmin, vmax = 0.05, 0.95
+        v = max(vmin, min(vmax, float(t)))
+        return float((1.0 - v) / (1.0 - vmin))
+
+    # posterize bits: bits càng thấp càng mạnh
+    if k_id == 9:
+        b = int(round(float(t)))
+        b = max(1, min(8, b))
+        return float((8 - b) / 7.0)
+
+    # solarize threshold: threshold càng thấp càng mạnh
+    if k_id == 10:
+        thr = int(round(float(t)))
+        thr = max(1, min(256, thr))
+        return float((256 - thr) / 255.0)
+
+    # hue: |hue| càng lớn càng mạnh
+    if k_id == 11:
+        v = max(-0.5, min(0.5, float(t)))
+        return float(abs(v) / 0.5)
+
+    return float("nan")
+
+def read_run_id_from_ckpt(ckpt_path, fallback_run_id):
+    """
+    Đọc run_id từ checkpoint.
+    Nếu checkpoint chưa có run_id thì dùng fallback_run_id.
+    """
+    if not os.path.exists(ckpt_path):
+        return fallback_run_id
+
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        return ckpt.get("run_id", fallback_run_id)
+    except Exception:
+        return fallback_run_id
+    
+def trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger = None):
+    """
+    Xóa các dòng iter log của epoch chưa hoàn tất để tránh duplicate khi resume.
+
+    Quy ước:
+    - nếu last_epoch = 7
+    - nghĩa là checkpoint hiện tại tương ứng trạng thái sau epoch 6
+    - vậy chỉ giữ meta/epoch < 7
+    """
+    if train_iter_csv is None:
+        return
+    
+    if not os.path.exists(train_iter_csv):
+        return
+
+    try: 
+        df = pd.read_csv(train_iter_csv)
+
+        if "meta/epoch" not in df.columns:
+            if logger is not None:
+                logger.info(
+                    f"[resume-trim] bỏ qua trim vì file không có cột meta/epoch: {train_iter_csv}"
+                )
+            return
+            
+        old_len = len(df)
+
+        df = df[df["meta/epoch"] < last_epoch].copy()
+
+        new_len = len(df)
+        removed = old_len - new_len
+        
+        df.to_csv(train_iter_csv, index = False)
+
+        if logger is not None:
+            logger.info(
+                f"[resume-trim] file={train_iter_csv}, last_epoch={last_epoch}, "
+                f"removed_rows={removed}, remaining_rows={new_len}"
+            )
+    except Exception as e:
+        if logger is not None:
+            logger.info(f"[resume-trim] lỗi khi trim iter csv: {e}")
+
+def build_iter_log_columns():
+    cols = [
+        # core training
+        "iter/sup_loss",
+        "iter/uns_loss",
+        "iter/pseudo_high_ratio",
+        "iter/lr",
+        "meta/epoch",
+        "meta/iter_in_epoch",
+
+        # Ar
+        "ar/triggered",
+        "ar/applied",
+        "ar/area_ratio_est",
+
+        # U
+        "u/entropy_mean",
+        "u/maxprob_mean",
+        "u/maxprob_p10",
+        "u/maxprob_p50",
+        "u/maxprob_p90",
+        "u/pseudo_ratio_mean",
+
+        # Aa global
+        "aa/ops_per_image",
+    ]
+
+    for kid in range(1, 12):
+        op_name = AA_OPS.get(kid, f"op{kid}")
+        cols.extend([
+            f"aa/op_rate/{op_name}",
+            f"aa/count/{op_name}",
+            f"aa/pct_mean/{op_name}",
+            f"aa/pct_max/{op_name}",
+            f"aa/t_mean/{op_name}",
+            f"aa/t_std/{op_name}",
+        ])
+
+    return cols
+
+
+ITER_LOG_COLUMNS = build_iter_log_columns()
+
+
+def make_default_iter_log_dict(
+    sup_loss,
+    uns_loss,
+    pseudo_high_ratio,
+    lr,
+    epoch,
+    step,
+    ar_triggered,
+    ar_applied,
+    ar_area_ratio_est,
+    u_entropy_mean,
+    u_maxprob_mean,
+    u_maxprob_p10,
+    u_maxprob_p50,
+    u_maxprob_p90,
+    u_pseudo_ratio_mean,
+):
+    log_dict = {
+        # core training
+        "iter/sup_loss": float(sup_loss),
+        "iter/uns_loss": float(uns_loss),
+        "iter/pseudo_high_ratio": float(pseudo_high_ratio),
+        "iter/lr": float(lr),
+        "meta/epoch": int(epoch),
+        "meta/iter_in_epoch": int(step),
+
+        # Ar
+        "ar/triggered": int(ar_triggered),
+        "ar/applied": int(ar_applied),
+        "ar/area_ratio_est": float(ar_area_ratio_est),
+
+        # U
+        "u/entropy_mean": float(u_entropy_mean),
+        "u/maxprob_mean": float(u_maxprob_mean),
+        "u/maxprob_p10": float(u_maxprob_p10),
+        "u/maxprob_p50": float(u_maxprob_p50),
+        "u/maxprob_p90": float(u_maxprob_p90),
+        "u/pseudo_ratio_mean": float(u_pseudo_ratio_mean),
+
+        # Aa global default
+        "aa/ops_per_image": 0.0,
+    }
+
+    for kid in range(1, 12):
+        op_name = AA_OPS.get(kid, f"op{kid}")
+        log_dict[f"aa/op_rate/{op_name}"] = 0.0
+        log_dict[f"aa/count/{op_name}"] = 0
+        log_dict[f"aa/pct_mean/{op_name}"] = -1.0
+        log_dict[f"aa/pct_max/{op_name}"] = -1.0
+        log_dict[f"aa/t_mean/{op_name}"] = -1.0
+        log_dict[f"aa/t_std/{op_name}"] = -1.0
+
+    return log_dict
+
 def main(in_args):
     args = in_args
     if args.seed is not None:
@@ -31,6 +239,10 @@ def main(in_args):
         # set_random_seed(args.seed)
     cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
     rank, word_size = setup_distributed(port=args.port)
+
+    # ✅ đặt ở đây
+    if rank != 0:
+        os.environ["WANDB_MODE"] = "disabled"
     
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     torch.cuda.set_device(local_rank)
@@ -47,24 +259,61 @@ def main(in_args):
         os.makedirs(cfg["log_path"])
     if not osp.exists(cfg["save_path"]) and rank == 0:
         os.makedirs(cfg["save_path"])
-    # my favorate: logs
+
     if rank == 0:
         logger, curr_timestr = setup_default_logging("global", cfg["log_path"])
-        csv_path = os.path.join(cfg["log_path"], "seg_{}_stat.csv".format(curr_timestr))
     else:
         logger, curr_timestr = None, ""
+    
+    # mặc định: coi như đây là một run mới
+    run_id = curr_timestr
+
+    # checkpoint latest
+    resume_ckpt = os.path.join(cfg["save_path"], "ckpt.pth")
+    
+    # nếu bật auto_resume và checkpoint đã tồn tại,
+    # thử đọc run_id cũ để nối lại đúng log cũ
+    if cfg["saver"].get("auto_resume", False) and os.path.exists(resume_ckpt):
+        run_id = read_run_id_from_ckpt(resume_ckpt,  curr_timestr)
+
+    # dùng run_id để đặt tên CSV
+    if rank == 0:
+        csv_path = os.path.join(cfg["log_path"], f"seg_{run_id}_stat.csv")
+        train_iter_csv = os.path.join(cfg["log_path"], f"train_iter_{run_id}.csv")
+    else:
         csv_path = None
-    # tensorboard
+        train_iter_csv = None
+
+    # tensorboard: hiện tại cứ để theo launch mới cho an toàn
     if rank == 0:
         logger.info("{}".format(pprint.pformat(cfg)))
+        logger.info(f"[log] run_id = {run_id}")
         if flag_use_tb:
-            tb_logger = SummaryWriter(
-                osp.join(cfg["log_path"], "events_seg",curr_timestr)
-            )
+            tb_logger = SummaryWriter(osp.join(cfg["log_path"], "events_seg", curr_timestr))
         else:
             tb_logger = None
     else:
         tb_logger = None
+
+    # ---------------- W&B (wandb) ----------------
+    wandb_run = None
+    use_wandb = cfg.get("wandb", {}).get("enable", False)
+
+    if use_wandb:
+        if rank != 0:
+            # DDP: chỉ rank0 log, rank khác tắt để khỏi spam nhiều runs
+            os.environ["WANDB_MODE"] = "disabled"
+        else:
+            import wandb
+            wandb_run = wandb.init(
+                project=cfg.get("wandb", {}).get("project", "AugsegResearch"),
+                entity=cfg.get("wandb", {}).get("entity", None),
+                name=cfg.get("wandb", {}).get("name", run_id),
+                config=cfg,
+                dir=cfg["log_path"],
+                settings=wandb.Settings(start_method="thread"),
+            )
+
     # make sure all folders and csv handler are correctly created on rank ==0.
     dist.barrier(device_ids=[local_rank])
 
@@ -155,6 +404,12 @@ def main(in_args):
                 lastest_model, model_teacher, optimizer=optimizer, key="teacher_state"
             )
 
+            # rất quan trọng:
+            # checkpoint resume từ đầu epoch last_epoch,
+            # nên phải xóa log iter của epoch chưa hoàn tất để tránh duplicate
+            if rank == 0:
+                trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger)
+
     optimizer_start = get_optimizer(params_list, cfg_optim)
     lr_scheduler = get_scheduler(
         cfg_trainer, len(train_loader_sup), optimizer_start, start_epoch=last_epoch
@@ -179,7 +434,9 @@ def main(in_args):
             epoch,
             tb_logger,
             logger,
-            cfg
+            cfg,
+            wandb_run,   # <-- thêm dòng này
+            train_iter_csv=train_iter_csv,
         )
 
         # Validation and store checkpoint
@@ -210,6 +467,7 @@ def main(in_args):
                 "optimizer_state": optimizer.state_dict(),
                 "teacher_state": model_teacher.state_dict(),
                 "best_miou": best_prec,
+                "run_id": run_id,
             }
             if prec_stu > best_prec_stu:
                 best_prec_stu = prec_stu
@@ -232,7 +490,7 @@ def main(in_args):
                         "best-stu":best_prec_stu}
             data_frame = pd.DataFrame(data=tmp_results, index=range(epoch, epoch+1))
             if epoch > 0 and osp.exists(csv_path):
-                data_frame.to_csv(csv_path, mode='a', header=None, index_label='epoch')
+                data_frame.to_csv(csv_path, mode='a', header=False, index_label='epoch')
             else:
                 data_frame.to_csv(csv_path, index_label='epoch')
             
@@ -240,7 +498,20 @@ def main(in_args):
                 prec_stu * 100, prec_tea * 100, best_prec_stu * 100, best_epoch_stu, best_prec * 100, best_epoch))
             if tb_logger is not None:
                 tb_logger.add_scalar("mIoU val", prec, epoch)
-    
+
+            if (rank == 0) and (wandb_run is not None):
+                global_step = int((epoch + 1) * len(train_loader_sup) - 1)
+                wandb_run.log({
+                    "val/miou_stu": float(prec_stu),
+                    "val/miou_tea": float(prec_tea),
+                    "epoch/loss_sup": float(res_loss_sup),
+                    "epoch/loss_unsup": float(res_loss_unsup),
+                    "meta/epoch": int(epoch + 1),
+                }, step=global_step)
+            
+    if (rank == 0) and (wandb_run is not None):
+        wandb_run.finish()
+
     if dist.is_available() and dist.is_initialized():
         dist.barrier(device_ids=[local_rank])
         dist.destroy_process_group()
@@ -261,11 +532,14 @@ def train(
     tb_logger,
     logger,
     cfg,
+    wandb_run=None,   # <-- thêm
+    train_iter_csv=None
 ):
 
     local_rank = torch.cuda.current_device()
     ema_decay_origin = cfg["net"]["ema_decay"]
     rank, world_size = dist.get_rank(), dist.get_world_size()
+    log_every = int(cfg.get("wandb", {}).get("log_every", 50))
     flag_extra_weak = cfg["trainer"]["unsupervised"].get("flag_extra_weak", False)
     model.train()
     
@@ -293,8 +567,23 @@ def train(
     model_teacher.eval()
     for step in range(len(loader_l)):
         batch_start = time.time()
+        # --------- init per-iter stats for wandb (tránh dính iter trước) ---------
+        ar_triggered = 0
+        ar_applied = 0
+        ar_area_ratio_est = float("nan")
+
+        u_entropy_mean = float("nan")
+        u_maxprob_mean = float("nan")
+        u_maxprob_p10 = float("nan")
+        u_maxprob_p50 = float("nan")
+        u_maxprob_p90 = float("nan")
+        u_pseudo_ratio_mean = float("nan")
 
         i_iter = epoch * len(loader_l) + step # total iters till now
+        # log schedule (đúng y hệt block W&B phía dưới)
+        do_log_now = (wandb_run is not None) and (rank == 0) and (
+            (i_iter % log_every == 0) or (step == len(loader_l) - 1)
+        )
         lr = lr_scheduler.get_lr()
         learning_rates.update(lr[0])
         lr_scheduler.step() # lr is updated at the iteration level
@@ -313,7 +602,17 @@ def train(
             print("label min/max:", label_l.min().item(), label_l.max().item())
             raise RuntimeError("Out-of-range labels in supervised mask")
 
-        _, image_u_weak, image_u_aug, _ = next(loader_u_iter)
+        batch_u = next(loader_u_iter)
+
+        # batch_u có thể là:
+        # - cũ: (idx, weak, strong, label)
+        # - mới: (idx, weak, strong, label, k_ids, t_vals)
+        if len(batch_u) == 4:
+            _, image_u_weak, image_u_aug, _ = batch_u
+            k_ids, t_vals = None, None
+        else:
+            _, image_u_weak, image_u_aug, _, k_ids, t_vals = batch_u
+
         image_u_weak = image_u_weak.cuda(local_rank, non_blocking=True)
         image_u_aug  = image_u_aug.cuda(local_rank, non_blocking=True)
     
@@ -351,22 +650,61 @@ def train(
                 confidence = confidence * logits_u_aug
                 confidence = confidence.mean(dim=[1,2])  # 1*C
                 confidence = confidence.cpu().numpy().tolist()
+                # effect stats: entropy mean (teacher on weak)
+                u_entropy_mean = float(entropy.detach().mean().item())
+
                 # confidence = logits_u_aug.ge(p_threshold).float().mean(dim=[1,2]).cpu().numpy().tolist()
                 del pred_u
             model.train()
             
-            # 2. apply cutmix
+            # 2. apply cutmix (Ar) + log flags
+            use_cutmix = cfg["trainer"]["unsupervised"].get("use_cutmix", False)
             trigger_prob = cfg["trainer"]["unsupervised"].get("use_cutmix_trigger_prob", 1.0)
-            if np.random.uniform(0, 1) < trigger_prob and cfg["trainer"]["unsupervised"].get("use_cutmix", False):
-                if cfg["trainer"]["unsupervised"].get("use_cutmix_adaptive", False):
+
+            rnd = np.random.uniform(0, 1)
+            ar_triggered = int(rnd < trigger_prob)
+            ar_applied = int(ar_triggered and use_cutmix)
+
+            if ar_applied:
+                # estimate area ratio CHỈ để log -> chỉ tính khi do_log_now
+                label_u_before = None
+                if do_log_now:
+                    label_u_before = label_u_aug.clone()                    
+
+                if cfg["trainer"]["unsupervised"].get("use_cutmix_adaptive", False):                                    
                     image_u_aug, label_u_aug, logits_u_aug = cut_mix_label_adaptive(
-                            image_u_aug,
-                            label_u_aug,
-                            logits_u_aug, 
-                            image_l,
-                            label_l, 
-                            confidence
-                        )
+                        image_u_aug, label_u_aug, logits_u_aug,
+                        image_l, label_l, confidence
+                    )
+                else:
+                    image_u_aug, label_u_aug, logits_u_aug = cut_mix_label_adaptive(
+                        image_u_aug, label_u_aug, logits_u_aug,
+                        image_l, label_l, confidence
+                    )
+
+                if label_u_before is not None:
+                    ar_area_ratio_est = (label_u_aug != label_u_before).float().mean().item()
+                    del label_u_before
+
+
+            # effect stats: maxprob quantiles + pseudo ratio (sau cutmix nếu có)
+            # CHỈ tính khi thật sự log để tránh chậm (torch.quantile khá tốn)
+            if do_log_now:
+                mp = logits_u_aug.detach()           # [B,H,W] max prob
+                mp_flat = mp.reshape(-1)
+
+                u_maxprob_mean = float(mp_flat.mean().item())
+                q = torch.quantile(
+                    mp_flat,
+                    torch.tensor([0.1, 0.5, 0.9], device=mp.device)
+                )
+                u_maxprob_p10 = float(q[0].item())
+                u_maxprob_p50 = float(q[1].item())
+                u_maxprob_p90 = float(q[2].item())
+
+                u_pseudo_ratio_mean = float((mp >= p_threshold).float().mean().item())
+
+
 
             # 3. forward concate labeled + unlabeld into student networks
             num_labeled = len(image_l)
@@ -461,11 +799,94 @@ def train(
                     lr=learning_rates,
                 )
             )
+
             if tb_logger is not None:
                 tb_logger.add_scalar("lr", learning_rates.avg, i_iter)
                 tb_logger.add_scalar("Sup Loss", sup_losses.avg, i_iter)
                 tb_logger.add_scalar("Uns Loss", uns_losses.avg, i_iter)
                 tb_logger.add_scalar("High ratio", meter_high_pseudo_ratio.avg, i_iter)
+
+        # ---------- W&B log: log theo iter ----------
+        if (wandb_run is not None) and (rank == 0):
+            do_log = (i_iter % log_every == 0) or (step == len(loader_l) - 1)
+            if do_log:
+                log_dict = make_default_iter_log_dict(
+                    sup_loss=sup_losses.val,
+                    uns_loss=uns_losses.val,
+                    pseudo_high_ratio=meter_high_pseudo_ratio.val,
+                    lr=learning_rates.val,
+                    epoch=epoch,
+                    step=step,
+                    ar_triggered=ar_triggered,
+                    ar_applied=ar_applied,
+                    ar_area_ratio_est=ar_area_ratio_est,
+                    u_entropy_mean=u_entropy_mean,
+                    u_maxprob_mean=u_maxprob_mean,
+                    u_maxprob_p10=u_maxprob_p10,
+                    u_maxprob_p50=u_maxprob_p50,
+                    u_maxprob_p90=u_maxprob_p90,
+                    u_pseudo_ratio_mean=u_pseudo_ratio_mean,
+                )
+
+                # -------- Aa (photometric) --------
+                if (k_ids is not None) and (t_vals is not None):
+                    k_np = k_ids.detach().cpu().numpy()
+                    t_np = t_vals.detach().cpu().numpy()
+
+                    log_dict["aa/ops_per_image"] = float((k_np > 0).sum(axis=1).mean())
+                    total_ops = max(int((k_np > 0).sum()), 1)
+
+                    AA_DEFAULT_PCT = {
+                        "identity": 0.0,
+                        "autocontrast": 100.0,
+                        "equalize": 100.0,
+                    }
+
+                    for kid in range(1, 12):
+                        op_name = AA_OPS.get(kid, f"op{kid}")
+                        m = (k_np == kid)
+                        cnt = int(m.sum())
+
+                        log_dict[f"aa/op_rate/{op_name}"] = cnt / total_ops
+                        log_dict[f"aa/count/{op_name}"] = cnt
+
+                        if cnt <= 0:
+                            # giữ default đã set sẵn:
+                            # pct_mean=-1, pct_max=-1, t_mean=-1, t_std=-1, count=0
+                            continue
+
+                        tv = t_np[m]
+                        tv = tv[np.isfinite(tv)]
+
+                        if tv.size > 0:
+                            sv = np.array([aa_strength(kid, float(x)) for x in tv], dtype=np.float32)
+                            sv = sv[np.isfinite(sv)]
+
+                            if sv.size > 0:
+                                sv_pct = sv * 100.0
+                                log_dict[f"aa/pct_mean/{op_name}"] = float(sv_pct.mean())
+                                log_dict[f"aa/pct_max/{op_name}"] = float(sv_pct.max())
+                            else:
+                                log_dict[f"aa/pct_mean/{op_name}"] = -1.0
+                                log_dict[f"aa/pct_max/{op_name}"] = -1.0
+
+                            log_dict[f"aa/t_mean/{op_name}"] = float(tv.mean())
+                            log_dict[f"aa/t_std/{op_name}"] = float(tv.std())
+                        else:
+                            default_pct = AA_DEFAULT_PCT.get(op_name, 100.0)
+                            log_dict[f"aa/pct_mean/{op_name}"] = float(default_pct)
+                            log_dict[f"aa/pct_max/{op_name}"] = float(default_pct)
+                            log_dict[f"aa/t_mean/{op_name}"] = -1.0
+                            log_dict[f"aa/t_std/{op_name}"] = -1.0
+
+                wandb_run.log(log_dict, step=int(i_iter))
+                if train_iter_csv is not None:
+                    df_row = pd.DataFrame([log_dict], columns=ITER_LOG_COLUMNS)
+                    if os.path.exists(train_iter_csv):
+                        df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
+                    else:
+                        df_row.to_csv(train_iter_csv, index=False)
+
     
     return sup_losses.avg, uns_losses.avg
 

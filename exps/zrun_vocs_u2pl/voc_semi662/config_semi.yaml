@@ -60,6 +60,7 @@ trainer: # Required.
 # 3. output files, and loss
 # # # # # # # # # # # # # # 
 saver:
+  auto_resume: True 
   snapshot_dir: checkpoints
   pretrain: ''
   use_tb: False
@@ -93,3 +94,10 @@ net: # Required.
       low_conv_planes: 48
       dilations: [6, 12, 18]  # [output_stride = 16]
       # dilations: [12, 24, 36]  # [output_stride = 8]
+
+wandb:
+  enable: True
+  project: AugsegResearch
+  entity: tanprodium-uit   # theo log của bạn: tanprodium (tanprodium-uit)
+  name: "voc662_r101_bs2_c513_lr1.25e-4_th0.95_w1.0_AaN3Rand_cm1cmad_p1.0_logv2"
+  log_every: 50

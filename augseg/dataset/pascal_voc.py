@@ -24,11 +24,13 @@ def seed_worker(worker_id):
 
 class voc_dset(BaseDataset):
     def __init__(
-        self, data_root, data_list, trs_form, trs_form_strong=None, 
+        self, data_root, data_list, trs_form, trs_form_strong=None,
         seed=0, n_sup=10582, split="val", flag_semi=False,
-        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225],
+        return_aug_meta=False
     ):
         super(voc_dset, self).__init__(data_list)
+        self.return_aug_meta = return_aug_meta
         self.data_root = data_root
         self.transform_weak = trs_form
         self.transform_strong = trs_form_strong
@@ -72,16 +74,23 @@ class voc_dset(BaseDataset):
             else:
                 return index, image, image.clone(), label
         else:
-            # apply augmentation
             image_weak, label = self.transform_weak(image, label)
-            image_strong = self.transform_strong(image_weak)
-            # print("="*100)
-            # print(index, image_weak.size, image_strong.size, label.size)
-            # print("="*100)
 
+            # --- mạnh: lấy cả k,t nếu cần ---
+            if self.return_aug_meta:
+                image_strong, k_ids, t_vals = self.transform_strong(image_weak, return_info=True)
+            else:
+                image_strong = self.transform_strong(image_weak)
+
+            # normalize -> tensor
             image_weak, label = self.trf_normalize(image_weak, label)
             image_strong, _ = self.trf_normalize(image_strong, label)
-            # print(index, image_weak.shape, image_strong.shape,label.shape)
+
+            if self.return_aug_meta:
+                # k_ids: [num_augs], t_vals: [num_augs]
+                k_ids = torch.tensor(k_ids, dtype=torch.int16)
+                t_vals = torch.tensor(t_vals, dtype=torch.float32)
+                return index, image_weak, image_strong, label, k_ids, t_vals
 
             return index, image_weak, image_strong, label
 
@@ -174,10 +183,14 @@ def build_voc_semi_loader(split, all_cfg, seed=0):
     sample_sup = DistributedSampler(dset)
 
     data_list_unsup = cfg["data_list"].replace("labeled.txt", "unlabeled.txt")
-    dset_unsup = voc_dset(cfg["data_root"], data_list_unsup, trs_form_weak, trs_form_strong,
-                            seed, n_sup, split,
-                            flag_semi=True,
-                            mean=mean, std=std)
+    dset_unsup = voc_dset(
+        cfg["data_root"], data_list_unsup,
+        trs_form_weak, trs_form_strong,
+        seed, n_sup, split,
+        flag_semi=True,
+        mean=mean, std=std,
+        return_aug_meta=True
+    )
     sample_unsup = DistributedSampler(dset_unsup)
 
     # create dataloader
