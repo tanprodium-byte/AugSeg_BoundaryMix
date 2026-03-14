@@ -76,6 +76,161 @@ def aa_strength(k_id: int, t: float) -> float:
 
     return float("nan")
 
+def read_run_id_from_ckpt(ckpt_path, fallback_run_id):
+    """
+    Đọc run_id từ checkpoint.
+    Nếu checkpoint chưa có run_id thì dùng fallback_run_id.
+    """
+    if not os.path.exists(ckpt_path):
+        return fallback_run_id
+
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        return ckpt.get("run_id", fallback_run_id)
+    except Exception:
+        return fallback_run_id
+    
+def trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger = None):
+    """
+    Xóa các dòng iter log của epoch chưa hoàn tất để tránh duplicate khi resume.
+
+    Quy ước:
+    - nếu last_epoch = 7
+    - nghĩa là checkpoint hiện tại tương ứng trạng thái sau epoch 6
+    - vậy chỉ giữ meta/epoch < 7
+    """
+    if train_iter_csv is None:
+        return
+    
+    if not os.path.exists(train_iter_csv):
+        return
+
+    try: 
+        df = pd.read_csv(train_iter_csv)
+
+        if "meta/epoch" not in df.columns:
+            if logger is not None:
+                logger.info(
+                    f"[resume-trim] bỏ qua trim vì file không có cột meta/epoch: {train_iter_csv}"
+                )
+            return
+            
+        old_len = len(df)
+
+        df = df[df["meta/epoch"] < last_epoch].copy()
+
+        new_len = len(df)
+        removed = old_len - new_len
+        
+        df.to_csv(train_iter_csv, index = False)
+
+        if logger is not None:
+            logger.info(
+                f"[resume-trim] file={train_iter_csv}, last_epoch={last_epoch}, "
+                f"removed_rows={removed}, remaining_rows={new_len}"
+            )
+    except Exception as e:
+        if logger is not None:
+            logger.info(f"[resume-trim] lỗi khi trim iter csv: {e}")
+
+def build_iter_log_columns():
+    cols = [
+        # core training
+        "iter/sup_loss",
+        "iter/uns_loss",
+        "iter/pseudo_high_ratio",
+        "iter/lr",
+        "meta/epoch",
+        "meta/iter_in_epoch",
+
+        # Ar
+        "ar/triggered",
+        "ar/applied",
+        "ar/area_ratio_est",
+
+        # U
+        "u/entropy_mean",
+        "u/maxprob_mean",
+        "u/maxprob_p10",
+        "u/maxprob_p50",
+        "u/maxprob_p90",
+        "u/pseudo_ratio_mean",
+
+        # Aa global
+        "aa/ops_per_image",
+    ]
+
+    for kid in range(1, 12):
+        op_name = AA_OPS.get(kid, f"op{kid}")
+        cols.extend([
+            f"aa/op_rate/{op_name}",
+            f"aa/count/{op_name}",
+            f"aa/pct_mean/{op_name}",
+            f"aa/pct_max/{op_name}",
+            f"aa/t_mean/{op_name}",
+            f"aa/t_std/{op_name}",
+        ])
+
+    return cols
+
+
+ITER_LOG_COLUMNS = build_iter_log_columns()
+
+
+def make_default_iter_log_dict(
+    sup_loss,
+    uns_loss,
+    pseudo_high_ratio,
+    lr,
+    epoch,
+    step,
+    ar_triggered,
+    ar_applied,
+    ar_area_ratio_est,
+    u_entropy_mean,
+    u_maxprob_mean,
+    u_maxprob_p10,
+    u_maxprob_p50,
+    u_maxprob_p90,
+    u_pseudo_ratio_mean,
+):
+    log_dict = {
+        # core training
+        "iter/sup_loss": float(sup_loss),
+        "iter/uns_loss": float(uns_loss),
+        "iter/pseudo_high_ratio": float(pseudo_high_ratio),
+        "iter/lr": float(lr),
+        "meta/epoch": int(epoch),
+        "meta/iter_in_epoch": int(step),
+
+        # Ar
+        "ar/triggered": int(ar_triggered),
+        "ar/applied": int(ar_applied),
+        "ar/area_ratio_est": float(ar_area_ratio_est),
+
+        # U
+        "u/entropy_mean": float(u_entropy_mean),
+        "u/maxprob_mean": float(u_maxprob_mean),
+        "u/maxprob_p10": float(u_maxprob_p10),
+        "u/maxprob_p50": float(u_maxprob_p50),
+        "u/maxprob_p90": float(u_maxprob_p90),
+        "u/pseudo_ratio_mean": float(u_pseudo_ratio_mean),
+
+        # Aa global default
+        "aa/ops_per_image": 0.0,
+    }
+
+    for kid in range(1, 12):
+        op_name = AA_OPS.get(kid, f"op{kid}")
+        log_dict[f"aa/op_rate/{op_name}"] = 0.0
+        log_dict[f"aa/count/{op_name}"] = 0
+        log_dict[f"aa/pct_mean/{op_name}"] = -1.0
+        log_dict[f"aa/pct_max/{op_name}"] = -1.0
+        log_dict[f"aa/t_mean/{op_name}"] = -1.0
+        log_dict[f"aa/t_std/{op_name}"] = -1.0
+
+    return log_dict
+
 def main(in_args):
     args = in_args
     if args.seed is not None:
@@ -104,17 +259,35 @@ def main(in_args):
         os.makedirs(cfg["log_path"])
     if not osp.exists(cfg["save_path"]) and rank == 0:
         os.makedirs(cfg["save_path"])
-    # my favorate: logs
+
     if rank == 0:
         logger, curr_timestr = setup_default_logging("global", cfg["log_path"])
-        csv_path = os.path.join(cfg["log_path"], "seg_{}_stat.csv".format(curr_timestr))
     else:
         logger, curr_timestr = None, ""
+    
+    # mặc định: coi như đây là một run mới
+    run_id = curr_timestr
+
+    # checkpoint latest
+    resume_ckpt = os.path.join(cfg["save_path"], "ckpt.pth")
+    
+    # nếu bật auto_resume và checkpoint đã tồn tại,
+    # thử đọc run_id cũ để nối lại đúng log cũ
+    if cfg["saver"].get("auto_resume", False) and os.path.exists(resume_ckpt):
+        run_id = read_run_id_from_ckpt(resume_ckpt,  curr_timestr)
+
+    # dùng run_id để đặt tên CSV
+    if rank == 0:
+        csv_path = os.path.join(cfg["log_path"], f"seg_{run_id}_stat.csv")
+        train_iter_csv = os.path.join(cfg["log_path"], f"train_iter_{run_id}.csv")
+    else:
         csv_path = None
-    train_iter_csv = os.path.join(cfg["log_path"], f"train_iter_{curr_timestr}.csv")
-    # tensorboard
+        train_iter_csv = None
+
+    # tensorboard: hiện tại cứ để theo launch mới cho an toàn
     if rank == 0:
         logger.info("{}".format(pprint.pformat(cfg)))
+        logger.info(f"[log] run_id = {run_id}")
         if flag_use_tb:
             tb_logger = SummaryWriter(osp.join(cfg["log_path"], "events_seg", curr_timestr))
         else:
@@ -135,7 +308,7 @@ def main(in_args):
             wandb_run = wandb.init(
                 project=cfg.get("wandb", {}).get("project", "AugsegResearch"),
                 entity=cfg.get("wandb", {}).get("entity", None),
-                name=cfg.get("wandb", {}).get("name", curr_timestr),
+                name=cfg.get("wandb", {}).get("name", run_id),
                 config=cfg,
                 dir=cfg["log_path"],
                 settings=wandb.Settings(start_method="thread"),
@@ -231,6 +404,12 @@ def main(in_args):
                 lastest_model, model_teacher, optimizer=optimizer, key="teacher_state"
             )
 
+            # rất quan trọng:
+            # checkpoint resume từ đầu epoch last_epoch,
+            # nên phải xóa log iter của epoch chưa hoàn tất để tránh duplicate
+            if rank == 0:
+                trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger)
+
     optimizer_start = get_optimizer(params_list, cfg_optim)
     lr_scheduler = get_scheduler(
         cfg_trainer, len(train_loader_sup), optimizer_start, start_epoch=last_epoch
@@ -288,6 +467,7 @@ def main(in_args):
                 "optimizer_state": optimizer.state_dict(),
                 "teacher_state": model_teacher.state_dict(),
                 "best_miou": best_prec,
+                "run_id": run_id,
             }
             if prec_stu > best_prec_stu:
                 best_prec_stu = prec_stu
@@ -310,7 +490,7 @@ def main(in_args):
                         "best-stu":best_prec_stu}
             data_frame = pd.DataFrame(data=tmp_results, index=range(epoch, epoch+1))
             if epoch > 0 and osp.exists(csv_path):
-                data_frame.to_csv(csv_path, mode='a', header=None, index_label='epoch')
+                data_frame.to_csv(csv_path, mode='a', header=False, index_label='epoch')
             else:
                 data_frame.to_csv(csv_path, index_label='epoch')
             
@@ -630,41 +810,32 @@ def train(
         if (wandb_run is not None) and (rank == 0):
             do_log = (i_iter % log_every == 0) or (step == len(loader_l) - 1)
             if do_log:
-                log_dict = {
-                    # core training
-                    "iter/sup_loss": float(sup_losses.val),
-                    "iter/uns_loss": float(uns_losses.val),
-                    "iter/pseudo_high_ratio": float(meter_high_pseudo_ratio.val),
-                    "iter/lr": float(learning_rates.val),
-                    "meta/epoch": int(epoch),
-                    "meta/iter_in_epoch": int(step),
-
-                    # Ar (CutMix)
-                    "ar/triggered": int(ar_triggered),
-                    "ar/applied": int(ar_applied),
-                    "ar/area_ratio_est": float(ar_area_ratio_est),
-
-                    # Effect (pseudo quality)
-                    "u/entropy_mean": float(u_entropy_mean),
-                    "u/maxprob_mean": float(u_maxprob_mean),
-                    "u/maxprob_p10": float(u_maxprob_p10),
-                    "u/maxprob_p50": float(u_maxprob_p50),
-                    "u/maxprob_p90": float(u_maxprob_p90),
-                    "u/pseudo_ratio_mean": float(u_pseudo_ratio_mean),
-                }
+                log_dict = make_default_iter_log_dict(
+                    sup_loss=sup_losses.val,
+                    uns_loss=uns_losses.val,
+                    pseudo_high_ratio=meter_high_pseudo_ratio.val,
+                    lr=learning_rates.val,
+                    epoch=epoch,
+                    step=step,
+                    ar_triggered=ar_triggered,
+                    ar_applied=ar_applied,
+                    ar_area_ratio_est=ar_area_ratio_est,
+                    u_entropy_mean=u_entropy_mean,
+                    u_maxprob_mean=u_maxprob_mean,
+                    u_maxprob_p10=u_maxprob_p10,
+                    u_maxprob_p50=u_maxprob_p50,
+                    u_maxprob_p90=u_maxprob_p90,
+                    u_pseudo_ratio_mean=u_pseudo_ratio_mean,
+                )
 
                 # -------- Aa (photometric) --------
                 if (k_ids is not None) and (t_vals is not None):
                     k_np = k_ids.detach().cpu().numpy()
                     t_np = t_vals.detach().cpu().numpy()
 
-                    # ops per image
                     log_dict["aa/ops_per_image"] = float((k_np > 0).sum(axis=1).mean())
-
-                    # op_rate: thay cho k_count tuyệt đối
                     total_ops = max(int((k_np > 0).sum()), 1)
 
-                    # strength mặc định cho các op không có tham số t
                     AA_DEFAULT_PCT = {
                         "identity": 0.0,
                         "autocontrast": 100.0,
@@ -676,73 +847,41 @@ def train(
                         m = (k_np == kid)
                         cnt = int(m.sum())
 
-                        # op_rate vẫn giữ nếu bạn muốn
                         log_dict[f"aa/op_rate/{op_name}"] = cnt / total_ops
-
-                        # ---- R1: LUÔN set 3 cột cho mọi op ----
-                        if cnt <= 0:
-                            # không dùng
-                            log_dict[f"aa/pct_mean/{op_name}"] = -1.0
-                            log_dict[f"aa/pct_max/{op_name}"] = -1.0
-                            log_dict[f"aa/count/{op_name}"] = 0
-                            # (optional) t_mean/t_std cho op không dùng: set -1 hoặc bỏ luôn
-                            continue
-
-                        # dùng (có thể duplicate)
                         log_dict[f"aa/count/{op_name}"] = cnt
+
+                        if cnt <= 0:
+                            # giữ default đã set sẵn:
+                            # pct_mean=-1, pct_max=-1, t_mean=-1, t_std=-1, count=0
+                            continue
 
                         tv = t_np[m]
                         tv = tv[np.isfinite(tv)]
 
                         if tv.size > 0:
-                            # có t -> tính strength từ aa_strength
                             sv = np.array([aa_strength(kid, float(x)) for x in tv], dtype=np.float32)
                             sv = sv[np.isfinite(sv)]
 
                             if sv.size > 0:
                                 sv_pct = sv * 100.0
                                 log_dict[f"aa/pct_mean/{op_name}"] = float(sv_pct.mean())
-                                log_dict[f"aa/pct_max/{op_name}"]  = float(sv_pct.max())
+                                log_dict[f"aa/pct_max/{op_name}"] = float(sv_pct.max())
                             else:
-                                # cực hiếm: có tv nhưng aa_strength ra NaN
                                 log_dict[f"aa/pct_mean/{op_name}"] = -1.0
-                                log_dict[f"aa/pct_max/{op_name}"]  = -1.0
+                                log_dict[f"aa/pct_max/{op_name}"] = -1.0
 
-                            # (optional) nếu vẫn muốn giữ raw t để debug range:
                             log_dict[f"aa/t_mean/{op_name}"] = float(tv.mean())
-                            log_dict[f"aa/t_std/{op_name}"]  = float(tv.std())
-
+                            log_dict[f"aa/t_std/{op_name}"] = float(tv.std())
                         else:
-                            # không có t (op bật/tắt) -> dùng default strength theo R1
-                            default_pct = AA_DEFAULT_PCT.get(op_name, 100.0)  # các op bật/tắt khác mặc định 100
+                            default_pct = AA_DEFAULT_PCT.get(op_name, 100.0)
                             log_dict[f"aa/pct_mean/{op_name}"] = float(default_pct)
-                            log_dict[f"aa/pct_max/{op_name}"]  = float(default_pct)
-                            # (optional) t_mean/t_std: set -1 để thống nhất
+                            log_dict[f"aa/pct_max/{op_name}"] = float(default_pct)
                             log_dict[f"aa/t_mean/{op_name}"] = -1.0
-                            log_dict[f"aa/t_std/{op_name}"]  = -1.0
-
-                    # drilldown text: 2 ảnh đầu
-                    def fmt_img(i):
-                        parts = []
-                        for kk, tt in zip(k_np[i].tolist(), t_np[i].tolist()):
-                            if kk <= 0:
-                                continue
-                            op = AA_OPS.get(int(kk), f"op{kk}")
-                            if np.isfinite(tt):
-                                s = aa_strength(int(kk), float(tt))
-                                parts.append(f"{op}(t={tt:.3g},s={s:.2f})")
-                            else:
-                                parts.append(f"{op}")
-                        return "[" + ", ".join(parts) + "]"
-
-                    if k_np.shape[0] >= 1:
-                        log_dict["aa/debug_img0"] = f"img0: {fmt_img(0)}"
-                    if k_np.shape[0] >= 2:
-                        log_dict["aa/debug_img1"] = f"img1: {fmt_img(1)}"
+                            log_dict[f"aa/t_std/{op_name}"] = -1.0
 
                 wandb_run.log(log_dict, step=int(i_iter))
                 if train_iter_csv is not None:
-                    df_row = pd.DataFrame([log_dict])
+                    df_row = pd.DataFrame([log_dict], columns=ITER_LOG_COLUMNS)
                     if os.path.exists(train_iter_csv):
                         df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
                     else:
