@@ -8,7 +8,7 @@ dataset: # Required.
     data_list: ./data/splitsall/pascal_u2pl/662/labeled.txt
     batch_size: 2
     flip: True
-    rand_resize: [0.5, 2.0]
+    rand_resize: [0.5, 2.0] 
     resize_base_size: 500
     crop:
       type: rand

@@ -81,14 +81,16 @@ def read_run_id_from_ckpt(ckpt_path, fallback_run_id):
     Đọc run_id từ checkpoint.
     Nếu checkpoint chưa có run_id thì dùng fallback_run_id.
     """
+    print(f"[DEBUG] loading ckpt: {ckpt_path}", flush=True)
+
     if not os.path.exists(ckpt_path):
         return fallback_run_id
 
-    try:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        return ckpt.get("run_id", fallback_run_id)
-    except Exception:
-        return fallback_run_id
+    t0 = time.time()
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    print(f"[DEBUG] torch.load finished in {time.time() - t0:.2f}s", flush=True)
+
+    return ckpt.get("run_id", fallback_run_id)
     
 def trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger = None):
     """
@@ -135,13 +137,25 @@ def trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger = None):
 
 def build_iter_log_columns():
     cols = [
+        # meta
+        "meta/log_type",
+        "meta/epoch",
+        "meta/iter_in_epoch",
+        "meta/global_iter",
+
         # core training
         "iter/sup_loss",
         "iter/uns_loss",
         "iter/pseudo_high_ratio",
         "iter/lr",
-        "meta/epoch",
-        "meta/iter_in_epoch",
+
+        # validation
+        "val/model",
+        "val/class_id",
+        "val/loss",
+        "val/miou",
+        "val/class_iou",
+        "val/best_miou",
 
         # Ar
         "ar/triggered",
@@ -184,6 +198,7 @@ def make_default_iter_log_dict(
     lr,
     epoch,
     step,
+    global_iter,
     ar_triggered,
     ar_applied,
     ar_area_ratio_est,
@@ -195,13 +210,25 @@ def make_default_iter_log_dict(
     u_pseudo_ratio_mean,
 ):
     log_dict = {
+        # meta
+        "meta/log_type": "train_iter",
+        "meta/epoch": int(epoch),
+        "meta/iter_in_epoch": int(step),
+        "meta/global_iter": int(global_iter),
+
         # core training
         "iter/sup_loss": float(sup_loss),
         "iter/uns_loss": float(uns_loss),
         "iter/pseudo_high_ratio": float(pseudo_high_ratio),
         "iter/lr": float(lr),
-        "meta/epoch": int(epoch),
-        "meta/iter_in_epoch": int(step),
+
+        # validation default
+        "val/model": "",
+        "val/class_id": -1,
+        "val/loss": float("nan"),
+        "val/miou": float("nan"),
+        "val/class_iou": float("nan"),
+        "val/best_miou": float("nan"),
 
         # Ar
         "ar/triggered": int(ar_triggered),
@@ -274,6 +301,7 @@ def main(in_args):
     # nếu bật auto_resume và checkpoint đã tồn tại,
     # thử đọc run_id cũ để nối lại đúng log cũ
     if cfg["saver"].get("auto_resume", False) and os.path.exists(resume_ckpt):
+        print(f"[DEBUG] resume_ckpt = {resume_ckpt}", flush=True)
         run_id = read_run_id_from_ckpt(resume_ckpt,  curr_timestr)
 
     # dùng run_id để đặt tên CSV
@@ -443,21 +471,31 @@ def main(in_args):
         if "cityscapes" in cfg["dataset"].get("type", "pascal"):
             if epoch % 10 == 0 or epoch > (cfg_trainer["epochs"]-50):
                 if cfg_trainer.get("evaluate_student", True):
-                    prec_stu = validate_citys(model, val_loader, epoch, logger, cfg)
+                    val_stu = validate_citys(model, val_loader, epoch, logger, cfg, sup_loss_fn)
+                    prec_stu = val_stu["miou"]
                 else:
-                    prec_stu =-1000.0
-                prec_tea = validate_citys(model_teacher, val_loader, epoch, logger, cfg)
+                    val_stu = None
+                    prec_stu = -1000.0
+
+                val_tea = validate_citys(model_teacher, val_loader, epoch, logger, cfg, sup_loss_fn)
+                prec_tea = val_tea["miou"]
                 prec = prec_tea
             else:
+                val_stu = None
+                val_tea = None
                 prec_stu = -1000.0
                 prec_tea = -1000.0
                 prec = prec_tea
         else:
             if cfg_trainer.get("evaluate_student", True):
-                prec_stu = validate(model, val_loader, epoch, logger, cfg)
+                val_stu = validate(model, val_loader, epoch, logger, cfg, sup_loss_fn)
+                prec_stu = val_stu["miou"]
             else:
+                val_stu = None
                 prec_stu = -1000.0
-            prec_tea = validate(model_teacher, val_loader, epoch, logger, cfg)
+
+            val_tea = validate(model_teacher, val_loader, epoch, logger, cfg, sup_loss_fn)
+            prec_tea = val_tea["miou"]
             prec = prec_tea
 
         if rank == 0:
@@ -493,6 +531,93 @@ def main(in_args):
                 data_frame.to_csv(csv_path, mode='a', header=False, index_label='epoch')
             else:
                 data_frame.to_csv(csv_path, index_label='epoch')
+
+            global_step = int((epoch + 1) * len(train_loader_sup) - 1)
+
+            # ---------------- val_epoch: student ----------------
+            if (train_iter_csv is not None) and (val_stu is not None):
+                row = {c: np.nan for c in ITER_LOG_COLUMNS}
+                row["meta/log_type"] = "val_epoch"
+                row["meta/epoch"] = int(epoch)
+                row["meta/iter_in_epoch"] = -1
+                row["meta/global_iter"] = int(global_step)
+
+                row["val/model"] = "student"
+                row["val/class_id"] = -1
+                row["val/loss"] = float(val_stu["loss"])
+                row["val/miou"] = float(val_stu["miou"])
+                row["val/class_iou"] = np.nan
+                row["val/best_miou"] = float(best_prec_stu)
+
+                df_row = pd.DataFrame([row], columns=ITER_LOG_COLUMNS)
+                if os.path.exists(train_iter_csv):
+                    df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
+                else:
+                    df_row.to_csv(train_iter_csv, index=False)
+
+            # ---------------- val_epoch: teacher ----------------
+            if (train_iter_csv is not None) and (val_tea is not None):
+                row = {c: np.nan for c in ITER_LOG_COLUMNS}
+                row["meta/log_type"] = "val_epoch"
+                row["meta/epoch"] = int(epoch)
+                row["meta/iter_in_epoch"] = -1
+                row["meta/global_iter"] = int(global_step)
+
+                row["val/model"] = "teacher"
+                row["val/class_id"] = -1
+                row["val/loss"] = float(val_tea["loss"])
+                row["val/miou"] = float(val_tea["miou"])
+                row["val/class_iou"] = np.nan
+                row["val/best_miou"] = float(best_prec)
+
+                df_row = pd.DataFrame([row], columns=ITER_LOG_COLUMNS)
+                if os.path.exists(train_iter_csv):
+                    df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
+                else:
+                    df_row.to_csv(train_iter_csv, index=False)
+
+            # ---------------- val_class: student ----------------
+            if (train_iter_csv is not None) and (val_stu is not None):
+                for class_id, class_iou in enumerate(val_stu["iou_class"]):
+                    row = {c: np.nan for c in ITER_LOG_COLUMNS}
+                    row["meta/log_type"] = "val_class"
+                    row["meta/epoch"] = int(epoch)
+                    row["meta/iter_in_epoch"] = -1
+                    row["meta/global_iter"] = int(global_step)
+
+                    row["val/model"] = "student"
+                    row["val/class_id"] = int(class_id)
+                    row["val/miou"] = float(val_stu["miou"])
+                    row["val/class_iou"] = float(class_iou)
+                    row["val/best_miou"] = float(best_prec_stu)
+
+                    df_row = pd.DataFrame([row], columns=ITER_LOG_COLUMNS)
+                    if os.path.exists(train_iter_csv):
+                        df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
+                    else:
+                        df_row.to_csv(train_iter_csv, index=False)
+
+            # ---------------- val_class: teacher ----------------
+            if (train_iter_csv is not None) and (val_tea is not None):
+                for class_id, class_iou in enumerate(val_tea["iou_class"]):
+                    row = {c: np.nan for c in ITER_LOG_COLUMNS}
+                    row["meta/log_type"] = "val_class"
+                    row["meta/epoch"] = int(epoch)
+                    row["meta/iter_in_epoch"] = -1
+                    row["meta/global_iter"] = int(global_step)
+
+                    row["val/model"] = "teacher"
+                    row["val/class_id"] = int(class_id)
+                    row["val/loss"] = np.nan
+                    row["val/miou"] = float(val_tea["miou"])
+                    row["val/class_iou"] = float(class_iou)
+                    row["val/best_miou"] = float(best_prec)
+
+                    df_row = pd.DataFrame([row], columns=ITER_LOG_COLUMNS)
+                    if os.path.exists(train_iter_csv):
+                        df_row.to_csv(train_iter_csv, mode="a", header=False, index=False)
+                    else:
+                        df_row.to_csv(train_iter_csv, index=False)
             
             logger.info(" <<Test>> - Epoch: {}.  MIoU: {:.2f}/{:.2f}.  \033[34mBest-STU:{:.2f}/{}  \033[31mBest-EMA: {:.2f}/{}\033[0m".format(epoch, 
                 prec_stu * 100, prec_tea * 100, best_prec_stu * 100, best_epoch_stu, best_prec * 100, best_epoch))
@@ -581,7 +706,7 @@ def train(
 
         i_iter = epoch * len(loader_l) + step # total iters till now
         # log schedule (đúng y hệt block W&B phía dưới)
-        do_log_now = (wandb_run is not None) and (rank == 0) and (
+        do_log_now = (rank == 0) and (
             (i_iter % log_every == 0) or (step == len(loader_l) - 1)
         )
         lr = lr_scheduler.get_lr()
@@ -806,8 +931,8 @@ def train(
                 tb_logger.add_scalar("Uns Loss", uns_losses.avg, i_iter)
                 tb_logger.add_scalar("High ratio", meter_high_pseudo_ratio.avg, i_iter)
 
-        # ---------- W&B log: log theo iter ----------
-        if (wandb_run is not None) and (rank == 0):
+        # ---------- Iter log: CSV luôn ghi, W&B là tùy chọn ----------
+        if rank == 0:
             do_log = (i_iter % log_every == 0) or (step == len(loader_l) - 1)
             if do_log:
                 log_dict = make_default_iter_log_dict(
@@ -817,6 +942,7 @@ def train(
                     lr=learning_rates.val,
                     epoch=epoch,
                     step=step,
+                    global_iter=i_iter,
                     ar_triggered=ar_triggered,
                     ar_applied=ar_applied,
                     ar_area_ratio_est=ar_area_ratio_est,
@@ -827,7 +953,6 @@ def train(
                     u_maxprob_p90=u_maxprob_p90,
                     u_pseudo_ratio_mean=u_pseudo_ratio_mean,
                 )
-
                 # -------- Aa (photometric) --------
                 if (k_ids is not None) and (t_vals is not None):
                     k_np = k_ids.detach().cpu().numpy()
@@ -851,8 +976,6 @@ def train(
                         log_dict[f"aa/count/{op_name}"] = cnt
 
                         if cnt <= 0:
-                            # giữ default đã set sẵn:
-                            # pct_mean=-1, pct_max=-1, t_mean=-1, t_std=-1, count=0
                             continue
 
                         tv = t_np[m]
@@ -866,20 +989,15 @@ def train(
                                 sv_pct = sv * 100.0
                                 log_dict[f"aa/pct_mean/{op_name}"] = float(sv_pct.mean())
                                 log_dict[f"aa/pct_max/{op_name}"] = float(sv_pct.max())
-                            else:
-                                log_dict[f"aa/pct_mean/{op_name}"] = -1.0
-                                log_dict[f"aa/pct_max/{op_name}"] = -1.0
 
                             log_dict[f"aa/t_mean/{op_name}"] = float(tv.mean())
                             log_dict[f"aa/t_std/{op_name}"] = float(tv.std())
-                        else:
-                            default_pct = AA_DEFAULT_PCT.get(op_name, 100.0)
-                            log_dict[f"aa/pct_mean/{op_name}"] = float(default_pct)
-                            log_dict[f"aa/pct_max/{op_name}"] = float(default_pct)
-                            log_dict[f"aa/t_mean/{op_name}"] = -1.0
-                            log_dict[f"aa/t_std/{op_name}"] = -1.0
 
-                wandb_run.log(log_dict, step=int(i_iter))
+                # W&B optional
+                if wandb_run is not None:
+                    wandb_run.log(log_dict, step=int(i_iter))
+
+                # CSV always on if path is provided
                 if train_iter_csv is not None:
                     df_row = pd.DataFrame([log_dict], columns=ITER_LOG_COLUMNS)
                     if os.path.exists(train_iter_csv):
@@ -896,7 +1014,8 @@ def validate(
     data_loader,
     epoch,
     logger,
-    cfg
+    cfg,
+    sup_loss_fn,
 ):
     model.eval()
     data_loader.sampler.set_epoch(epoch)
@@ -910,24 +1029,32 @@ def validate(
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
 
+    loss_meter = AverageMeter()
+
     for step, batch in enumerate(data_loader):
         _, images, labels = batch
         images = images.cuda()
         labels = labels.long().cuda()
 
         with torch.no_grad():
-            output, _ = model(images)
+            pred, aux = model(images)
 
-        # get the output produced by model_teacher
-        output = output.data.max(1)[1].cpu().numpy()
+            if "aux_loss" in cfg["net"].keys():
+                val_loss = sup_loss_fn([pred, aux], labels)
+            else:
+                val_loss = sup_loss_fn(pred, labels)
+
+        reduced_val_loss = val_loss.detach().clone()
+        dist.all_reduce(reduced_val_loss)
+        loss_meter.update(reduced_val_loss.item() / world_size)
+
+        output = pred.data.max(1)[1].cpu().numpy()
         target_origin = labels.cpu().numpy()
 
-        # start to calculate miou
         intersection, union, target = intersectionAndUnion(
             output, target_origin, num_classes, ignore_label
         )
 
-        # gather all validation information
         reduced_intersection = torch.from_numpy(intersection).cuda()
         reduced_union = torch.from_numpy(union).cuda()
         reduced_target = torch.from_numpy(target).cuda()
@@ -946,15 +1073,19 @@ def validate(
         for i, iou in enumerate(iou_class):
             logger.info(" [Test] -  class [{}] IoU {:.2f}".format(i, iou * 100))
 
-    return mIoU
-
+    return {
+        "loss": float(loss_meter.avg),
+        "miou": float(mIoU),
+        "iou_class": iou_class.astype(np.float64),
+    }
 
 def validate_citys(
     model,
     data_loader,
     epoch,
     logger,
-    cfg
+    cfg,
+    sup_loss_fn,
 ):
     model.eval()
     data_loader.sampler.set_epoch(epoch)
@@ -969,6 +1100,7 @@ def validate_citys(
 
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
+    loss_meter = AverageMeter()
 
     for step, batch in enumerate(data_loader):
         _, images, labels = batch
@@ -982,23 +1114,30 @@ def validate_citys(
             while row < h:
                 col = 0
                 while col < w:
-                    pred, _ = model(images[:, :, row: min(h, row + crop_size), col: min(w, col + crop_size)])
-                    final[:, :, row: min(h, row + crop_size), col: min(w, col + crop_size)] += pred.softmax(dim=1)
+                    pred, _ = model(
+                        images[:, :, row:min(h, row + crop_size), col:min(w, col + crop_size)]
+                    )
+                    final[:, :, row:min(h, row + crop_size), col:min(w, col + crop_size)] += pred.softmax(dim=1)
                     col += int(crop_size * 2 / 3)
                 row += int(crop_size * 2 / 3)
-            # get the output
+
+            labels_cuda = labels.cuda()
+            if "aux_loss" in cfg["net"].keys():
+                val_loss = sup_loss_fn([final, final], labels_cuda)
+            else:
+                val_loss = sup_loss_fn(final, labels_cuda)
+
+            reduced_val_loss = val_loss.detach().clone()
+            dist.all_reduce(reduced_val_loss)
+            loss_meter.update(reduced_val_loss.item() / world_size)
+
             output = final.argmax(dim=1).cpu().numpy()
             target_origin = labels.numpy()
-            # print("="*50, output.shape, output.dtype, target_origin.shape, target_origin.dtype)
 
-        # start to calculate miou
         intersection, union, target = intersectionAndUnion(
             output, target_origin, num_classes, ignore_label
         )
-        # # return ndarray, b*clas
-        # print("="*20, type(intersection), type(union), type(target), intersection, union, target)
 
-        # gather all validation information
         reduced_intersection = torch.from_numpy(intersection).cuda()
         reduced_union = torch.from_numpy(union).cuda()
         reduced_target = torch.from_numpy(target).cuda()
@@ -1016,7 +1155,12 @@ def validate_citys(
     if rank == 0:
         for i, iou in enumerate(iou_class):
             logger.info(" [Test] -  class [{}] IoU {:.2f}".format(i, iou * 100))
-    return mIoU
+
+    return {
+        "loss": float(loss_meter.avg),
+        "miou": float(mIoU),
+        "iou_class": iou_class.astype(np.float64),
+    }
 
 
 if __name__ == "__main__":
