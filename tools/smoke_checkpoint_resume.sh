@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${ROOT}/exps/debug_checkpoint_resume/config.yaml"
 SMOKE_SPLIT_DIR="${ROOT}/exps/debug_checkpoint_resume/pascal_smoke"
 SRC_SPLIT_DIR="${ROOT}/data/splitsall/pascal_u2pl/662"
+SRC_VAL_SPLIT="${ROOT}/data/splitsall/pascal_u2pl/val.txt"
 DATA_ROOT="${ROOT}/data/VOC2012"
 PORT="${PORT:-53917}"
 
@@ -17,16 +18,20 @@ if [[ ! -d "${DATA_ROOT}" ]]; then
   exit 2
 fi
 
-if [[ ! -f "${SRC_SPLIT_DIR}/labeled.txt" || ! -f "${SRC_SPLIT_DIR}/unlabeled.txt" || ! -f "${SRC_SPLIT_DIR}/val.txt" ]]; then
+if [[ ! -f "${SRC_VAL_SPLIT}" && -f "${SRC_SPLIT_DIR}/val.txt" ]]; then
+  SRC_VAL_SPLIT="${SRC_SPLIT_DIR}/val.txt"
+fi
+
+if [[ ! -f "${SRC_SPLIT_DIR}/labeled.txt" || ! -f "${SRC_SPLIT_DIR}/unlabeled.txt" || ! -f "${SRC_VAL_SPLIT}" ]]; then
   echo "Missing source split files under: ${SRC_SPLIT_DIR}" >&2
-  echo "Expected labeled.txt, unlabeled.txt, and val.txt." >&2
+  echo "Expected labeled.txt, unlabeled.txt, and parent or local val.txt." >&2
   exit 2
 fi
 
 mkdir -p "${SMOKE_SPLIT_DIR}"
 sed -n '1p' "${SRC_SPLIT_DIR}/labeled.txt" > "${SMOKE_SPLIT_DIR}/labeled.txt"
 sed -n '1p' "${SRC_SPLIT_DIR}/unlabeled.txt" > "${SMOKE_SPLIT_DIR}/unlabeled.txt"
-sed -n '1p' "${SRC_SPLIT_DIR}/val.txt" > "${SMOKE_SPLIT_DIR}/val.txt"
+sed -n '1p' "${SRC_VAL_SPLIT}" > "${SMOKE_SPLIT_DIR}/val.txt"
 
 first_id="$(sed -n '1p' "${SMOKE_SPLIT_DIR}/labeled.txt")"
 if [[ -z "${first_id}" ]]; then
