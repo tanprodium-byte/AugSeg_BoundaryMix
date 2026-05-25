@@ -19,9 +19,26 @@ from augseg.models.model_helper import ModelBuilder
 from augseg.utils.loss_helper import get_criterion
 from augseg.dataset.builder import get_loader
 from augseg.utils.lr_helper import get_optimizer, get_scheduler
-from augseg.utils.utils import load_state, AverageMeter, intersectionAndUnion
+from augseg.utils.utils import AverageMeter, intersectionAndUnion
 from augseg.dataset.augs_ALIA import cut_mix_label_adaptive
 from augseg.utils.loss_helper import compute_unsupervised_loss_by_threshold
+from util.run_logging import (
+    get_or_create_run_id,
+    append_csv_row,
+    trim_csv_rows_by_epoch,
+    default_log_paths,
+    get_git_commit,
+    write_json,
+)
+from util.checkpointing import (
+    save_checkpoint,
+    load_checkpoint_if_available,
+    copy_config_to_save_path,
+)
+from util.hf_auto import (
+    maybe_download_hf_bundle,
+    maybe_upload_hf_bundle,
+)
 
 # ---------------- Aa op mapping + strength normalize (0..1) ----------------
 AA_OPS = {
@@ -281,6 +298,25 @@ def main(in_args):
     cfg["save_path"] = osp.join(cfg["exp_path"], cfg["saver"]["snapshot_dir"])
     cfg["log_path"] = osp.join(cfg["exp_path"], "log")
     flag_use_tb = cfg["saver"]["use_tb"]
+
+    cfg.setdefault("run", {})
+    cfg["run"].setdefault("name", os.path.basename(os.path.normpath(cfg["save_path"])) or "run")
+    cfg["run"].setdefault("log_every", cfg.get("wandb", {}).get("log_every", 50))
+
+    cfg.setdefault("checkpoint", {})
+    cfg["checkpoint"].setdefault("auto_resume", True)
+    cfg["checkpoint"].setdefault("save_latest", True)
+    cfg["checkpoint"].setdefault("save_best", True)
+
+    cfg.setdefault("hf", {})
+    cfg["hf"].setdefault("enabled", False)
+    cfg["hf"].setdefault("repo_type", "model")
+    cfg["hf"].setdefault("auto_download", True)
+    cfg["hf"].setdefault("auto_upload", True)
+    cfg["hf"].setdefault("upload_every_epoch", True)
+    cfg["hf"].setdefault("keep_only_latest", True)
+    cfg["hf"].setdefault("bundle_name", "latest.tar.gz")
+    cfg["hf"].setdefault("squash_after_upload", False)
     
     if not os.path.exists(cfg["log_path"]) and rank == 0:
         os.makedirs(cfg["log_path"])
@@ -288,21 +324,25 @@ def main(in_args):
         os.makedirs(cfg["save_path"])
 
     if rank == 0:
+        maybe_download_hf_bundle(
+            cfg=cfg,
+            save_path=cfg["save_path"],
+            skip_if_ckpt_exists=True,
+        )
+        copy_config_to_save_path(args.config, cfg["save_path"])
         logger, curr_timestr = setup_default_logging("global", cfg["log_path"])
     else:
         logger, curr_timestr = None, ""
-    
-    # mặc định: coi như đây là một run mới
-    run_id = curr_timestr
 
-    # checkpoint latest
-    resume_ckpt = os.path.join(cfg["save_path"], "ckpt.pth")
-    
-    # nếu bật auto_resume và checkpoint đã tồn tại,
-    # thử đọc run_id cũ để nối lại đúng log cũ
-    if cfg["saver"].get("auto_resume", False) and os.path.exists(resume_ckpt):
-        print(f"[DEBUG] resume_ckpt = {resume_ckpt}", flush=True)
-        run_id = read_run_id_from_ckpt(resume_ckpt,  curr_timestr)
+    if rank == 0:
+        run_id = get_or_create_run_id(cfg["save_path"], cfg["run"]["name"])
+    else:
+        run_id = ""
+
+    run_id_list = [run_id]
+    dist.broadcast_object_list(run_id_list, src=0)
+    run_id = run_id_list[0]
+    log_paths = default_log_paths(cfg["save_path"])
 
     # dùng run_id để đặt tên CSV
     if rank == 0:
@@ -419,28 +459,36 @@ def main(in_args):
     best_prec_stu = 0
     best_epoch_stu = -1
     # auto_resume > pretrain
-    if cfg["saver"].get("auto_resume", False):
-        lastest_model = os.path.join(cfg["save_path"], "ckpt.pth")
-        if not os.path.exists(lastest_model):
-            "No checkpoint found in '{}'".format(lastest_model)
-        else:
-            print(f"Resume model from: '{lastest_model}'")
-            best_prec, last_epoch = load_state(
-                lastest_model, model, optimizer=optimizer, key="model_state"
-            )
-            _, _ = load_state(
-                lastest_model, model_teacher, optimizer=optimizer, key="teacher_state"
-            )
+    last_epoch, best_prec, ckpt_run_id, ckpt_path = load_checkpoint_if_available(
+        save_path=cfg["save_path"],
+        model=model,
+        teacher_model=model_teacher,
+        optimizer=optimizer,
+        auto_resume=bool(cfg.get("checkpoint", {}).get("auto_resume", True)),
+        filename="ckpt.pth",
+        map_location="cuda:%d" % local_rank,
+        strict=True,
+    )
+    if ckpt_run_id:
+        run_id = ckpt_run_id
+        if rank == 0:
+            with open(os.path.join(cfg["save_path"], "run_id.txt"), "w") as f:
+                f.write(str(run_id) + "\n")
+            csv_path = os.path.join(cfg["log_path"], f"seg_{run_id}_stat.csv")
+            train_iter_csv = os.path.join(cfg["log_path"], f"train_iter_{run_id}.csv")
 
-            # rất quan trọng:
-            # checkpoint resume từ đầu epoch last_epoch,
-            # nên phải xóa log iter của epoch chưa hoàn tất để tránh duplicate
-            if rank == 0:
-                trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger)
+    if rank == 0 and ckpt_path is not None:
+        logger.info("Resumed checkpoint from %s, start_epoch=%d, best_miou=%.4f" %
+                    (str(ckpt_path), last_epoch, best_prec))
+        trim_iter_csv_for_resume(train_iter_csv, last_epoch, logger)
+        trim_csv_rows_by_epoch(csv_path, keep_epoch_lt=last_epoch)
+        trim_csv_rows_by_epoch(log_paths["epoch_csv"], keep_epoch_lt=last_epoch)
+        trim_csv_rows_by_epoch(log_paths["iter_csv"], keep_epoch_lt=last_epoch)
 
-    optimizer_start = get_optimizer(params_list, cfg_optim)
+    dist.barrier(device_ids=[local_rank])
+
     lr_scheduler = get_scheduler(
-        cfg_trainer, len(train_loader_sup), optimizer_start, start_epoch=last_epoch
+        cfg_trainer, len(train_loader_sup), optimizer, start_epoch=last_epoch
     )
 
     ######################################
@@ -499,25 +547,15 @@ def main(in_args):
             prec = prec_tea
 
         if rank == 0:
-            state = {
-                "epoch": epoch + 1,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "teacher_state": model_teacher.state_dict(),
-                "best_miou": best_prec,
-                "run_id": run_id,
-            }
             if prec_stu > best_prec_stu:
                 best_prec_stu = prec_stu
                 best_epoch_stu = epoch
 
-            if prec > best_prec:
+            is_best = prec > best_prec
+            if is_best:
                 best_prec = prec
                 best_epoch = epoch
-                state["best_miou"] = prec
-                torch.save(state, osp.join(cfg["save_path"], "ckpt_best.pth"))
 
-            torch.save(state, osp.join(cfg["save_path"], "ckpt.pth"))
             # save statistics
             tmp_results = {
                         'loss_lb': res_loss_sup,
@@ -623,6 +661,57 @@ def main(in_args):
                 prec_stu * 100, prec_tea * 100, best_prec_stu * 100, best_epoch_stu, best_prec * 100, best_epoch))
             if tb_logger is not None:
                 tb_logger.add_scalar("mIoU val", prec, epoch)
+
+            manifest = {
+                "epoch": int(epoch),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "loss_lb": float(res_loss_sup),
+                "loss_ub": float(res_loss_unsup),
+                "miou_stu": float(prec_stu),
+                "miou_tea": float(prec_tea),
+                "best_miou": float(best_prec),
+                "best_miou_stu": float(best_prec_stu),
+                "best_epoch": int(best_epoch),
+                "best_epoch_stu": int(best_epoch_stu),
+                "is_best": bool(is_best),
+                "run_name": str(cfg.get("run", {}).get("name", "run")),
+                "run_id": str(run_id),
+                "config_path": args.config,
+                "save_path": cfg["save_path"],
+                "world_size": word_size,
+                "git_commit": get_git_commit("."),
+            }
+            write_json(log_paths["manifest"], manifest)
+            append_csv_row(log_paths["epoch_csv"], manifest)
+
+            save_checkpoint(
+                save_path=cfg["save_path"],
+                model=model,
+                teacher_model=model_teacher,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                best_miou=best_prec,
+                run_id=run_id,
+                cfg=cfg,
+                args=args,
+                is_best=is_best,
+                save_latest=bool(cfg.get("checkpoint", {}).get("save_latest", True)),
+                save_best=bool(cfg.get("checkpoint", {}).get("save_best", True)),
+                extra={
+                    "manifest": manifest,
+                    "best_miou_stu": best_prec_stu,
+                    "best_epoch": best_epoch,
+                    "best_epoch_stu": best_epoch_stu,
+                },
+            )
+
+            if bool(cfg.get("hf", {}).get("enabled", False)) and bool(cfg.get("hf", {}).get("upload_every_epoch", True)):
+                maybe_upload_hf_bundle(
+                    cfg=cfg,
+                    save_path=cfg["save_path"],
+                    config_path=args.config,
+                    manifest=manifest,
+                )
 
             if (rank == 0) and (wandb_run is not None):
                 global_step = int((epoch + 1) * len(train_loader_sup) - 1)
