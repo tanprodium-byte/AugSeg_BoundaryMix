@@ -31,3 +31,12 @@ VOCtrainval_11-May-2012.tar
 
 # W&B local
 wandb/
+
+# Smoke-test generated artifacts
+exp_smoke_checkpoint_resume/
+exps/debug_checkpoint_resume/pascal_smoke/
+
+# Local checkpoints / logs
+*.pth
+events.out.tfevents*
+__pycache__/
