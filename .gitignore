@@ -1,6 +1,8 @@
 # datasets / generated outputs
 data/
 exps/**/checkpoints/
+exp_smoke_checkpoint_resume/
+exps/debug_checkpoint_resume/pascal_smoke/
 exps/**/log/
 checkpoints/
 # weights / exported models
