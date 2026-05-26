@@ -1,11 +1,11 @@
 # Minimal 1-GPU checkpoint/resume smoke config.
 # tools/smoke_checkpoint_resume.sh creates one-line split files under
-# exps/debug_checkpoint_resume/pascal_smoke before launching train_semi.py.
+# exps/debug_boundary_mix/pascal_smoke before launching train_semi.py.
 dataset:
   type: pascal_semi
   train:
     data_root: ./data/VOC2012
-    data_list: ./exps/debug_checkpoint_resume/pascal_smoke/labeled.txt
+    data_list: ./exps/debug_boundary_mix/pascal_smoke/labeled.txt
     batch_size: 1
     flip: False
     rand_resize: [1.0, 1.0]
@@ -18,7 +18,7 @@ dataset:
       flag_use_random_num_sampling: False
   val:
     data_root: ./data/VOC2012
-    data_list: ./exps/debug_checkpoint_resume/pascal_smoke/val.txt
+    data_list: ./exps/debug_boundary_mix/pascal_smoke/val.txt
     batch_size: 1
     crop:
       type: center
@@ -47,17 +47,17 @@ trainer:
     flag_extra_weak: False
     threshold: 0.95
     loss_weight: 1.0
-    use_cutmix: False
+    use_cutmix: True
     use_cutmix_adaptive: False
-    use_cutmix_trigger_prob: 0.0
+    use_cutmix_trigger_prob: 1.0
 
 saver:
-  snapshot_dir: ../../exp_smoke_checkpoint_resume
+  snapshot_dir: ../../exp_smoke_boundary_mix
   pretrain: ''
   use_tb: False
 
 checkpoint:
-  auto_resume: True
+  auto_resume: False
   save_latest: True
   save_best: True
 
@@ -96,12 +96,12 @@ wandb:
   log_every: 1
 
 run:
-  name: smoke_checkpoint_resume
+  name: smoke_boundary_mix
   log_every: 1
 
 
 boundary_mix:
-  enabled: false
+  enabled: true
   mode: fixed
   kernel_size: 5
   gamma_in: 0.7

@@ -22,6 +22,10 @@ from augseg.utils.lr_helper import get_optimizer, get_scheduler
 from augseg.utils.utils import AverageMeter, intersectionAndUnion
 from augseg.dataset.augs_ALIA import cut_mix_label_adaptive
 from augseg.utils.loss_helper import compute_unsupervised_loss_by_threshold
+from util.boundary_mix import (
+    cut_mix_label_adaptive_with_mask,
+    thresholded_boundary_mix_loss,
+)
 from util.run_logging import (
     get_or_create_run_id,
     append_csv_row,
@@ -317,6 +321,16 @@ def main(in_args):
     cfg["hf"].setdefault("keep_only_latest", True)
     cfg["hf"].setdefault("bundle_name", "latest.tar.gz")
     cfg["hf"].setdefault("squash_after_upload", False)
+
+    cfg.setdefault("boundary_mix", {})
+    cfg["boundary_mix"].setdefault("enabled", False)
+    cfg["boundary_mix"].setdefault("mode", "fixed")
+    cfg["boundary_mix"].setdefault("kernel_size", 5)
+    cfg["boundary_mix"].setdefault("gamma_in", 0.7)
+    cfg["boundary_mix"].setdefault("gamma_out", 0.3)
+    cfg["boundary_mix"].setdefault("use_confidence", True)
+    cfg["boundary_mix"].setdefault("normalize_weight", True)
+    cfg["boundary_mix"].setdefault("debug", False)
     
     if not os.path.exists(cfg["log_path"]) and rank == 0:
         os.makedirs(cfg["log_path"])
@@ -755,6 +769,8 @@ def train(
     rank, world_size = dist.get_rank(), dist.get_world_size()
     log_every = int(cfg.get("wandb", {}).get("log_every", 50))
     flag_extra_weak = cfg["trainer"]["unsupervised"].get("flag_extra_weak", False)
+    boundary_mix_cfg = cfg.get("boundary_mix", {})
+    boundary_mix_enabled = bool(boundary_mix_cfg.get("enabled", False))
     model.train()
     
     # data loader
@@ -879,13 +895,19 @@ def train(
             ar_triggered = int(rnd < trigger_prob)
             ar_applied = int(ar_triggered and use_cutmix)
 
+            mix_source_mask = None
             if ar_applied:
                 # estimate area ratio CHỈ để log -> chỉ tính khi do_log_now
                 label_u_before = None
                 if do_log_now:
                     label_u_before = label_u_aug.clone()                    
 
-                if cfg["trainer"]["unsupervised"].get("use_cutmix_adaptive", False):                                    
+                if boundary_mix_enabled:
+                    image_u_aug, label_u_aug, logits_u_aug, mix_source_mask = cut_mix_label_adaptive_with_mask(
+                        image_u_aug, label_u_aug, logits_u_aug,
+                        image_l, label_l, confidence
+                    )
+                elif cfg["trainer"]["unsupervised"].get("use_cutmix_adaptive", False):                                    
                     image_u_aug, label_u_aug, logits_u_aug = cut_mix_label_adaptive(
                         image_u_aug, label_u_aug, logits_u_aug,
                         image_l, label_l, confidence
@@ -944,9 +966,24 @@ def train(
                 sup_loss = sup_loss_fn(pred_l, label_l)
 
             # 5. unsupervised loss
-            unsup_loss, pseduo_high_ratio = compute_unsupervised_loss_by_threshold(
-                        pred_u_strong, label_u_aug.detach(),
-                        logits_u_aug.detach(), thresh=p_threshold)
+            if boundary_mix_enabled and mix_source_mask is not None:
+                unsup_loss, pseduo_high_ratio = thresholded_boundary_mix_loss(
+                    pred_u_strong,
+                    label_u_aug.detach(),
+                    logits_u_aug.detach(),
+                    mix_source_mask.detach(),
+                    thresh=p_threshold,
+                    ignore_index=ignore,
+                    kernel_size=int(boundary_mix_cfg.get("kernel_size", 5)),
+                    gamma_in=float(boundary_mix_cfg.get("gamma_in", 0.7)),
+                    gamma_out=float(boundary_mix_cfg.get("gamma_out", 0.3)),
+                    use_confidence=bool(boundary_mix_cfg.get("use_confidence", True)),
+                    normalize_weight=bool(boundary_mix_cfg.get("normalize_weight", True)),
+                )
+            else:
+                unsup_loss, pseduo_high_ratio = compute_unsupervised_loss_by_threshold(
+                            pred_u_strong, label_u_aug.detach(),
+                            logits_u_aug.detach(), thresh=p_threshold)
             unsup_loss *= cfg["trainer"]["unsupervised"].get("loss_weight", 1.0)
             del pred_l, pred_u_strong, label_u_aug, logits_u_aug
 
