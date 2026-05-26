@@ -70,6 +70,83 @@ def boundary_confidence_weight_map(
     return weight.squeeze(1)
 
 
+def _masked_mean(values, mask):
+    mask = mask.to(dtype=torch.bool)
+    if not mask.any():
+        return float("nan")
+    return float(values[mask].detach().mean().item())
+
+
+def boundary_mix_debug_tensors(
+    mix_mask,
+    confidence,
+    *,
+    kernel_size=5,
+    gamma_in=0.7,
+    gamma_out=0.3,
+    use_confidence=True,
+    normalize_weight=True,
+):
+    mask = _as_bchw_mask(mix_mask).clamp(0.0, 1.0)
+    confidence = _as_bchw_mask(confidence).to(device=mask.device, dtype=mask.dtype)
+    inner, outer = get_inner_outer_boundary(mask, kernel_size=kernel_size)
+    weight = boundary_confidence_weight_map(
+        mask,
+        confidence,
+        kernel_size=kernel_size,
+        gamma_in=gamma_in,
+        gamma_out=gamma_out,
+        use_confidence=use_confidence,
+        normalize_weight=normalize_weight,
+    ).unsqueeze(1)
+    target_exterior = ((1.0 - mask) - outer).clamp(0.0, 1.0)
+
+    return {
+        "mask": mask,
+        "inner": inner,
+        "outer": outer,
+        "confidence": confidence,
+        "weight": weight,
+        "target_exterior": target_exterior,
+    }
+
+
+def boundary_mix_debug_stats(
+    mix_mask,
+    confidence,
+    *,
+    kernel_size=5,
+    gamma_in=0.7,
+    gamma_out=0.3,
+    use_confidence=True,
+    normalize_weight=True,
+):
+    tensors = boundary_mix_debug_tensors(
+        mix_mask,
+        confidence,
+        kernel_size=kernel_size,
+        gamma_in=gamma_in,
+        gamma_out=gamma_out,
+        use_confidence=use_confidence,
+        normalize_weight=normalize_weight,
+    )
+    weight = tensors["weight"]
+    inner = tensors["inner"]
+    outer = tensors["outer"]
+    confidence = tensors["confidence"]
+    target_exterior = tensors["target_exterior"]
+
+    return {
+        "weight_mean": float(weight.detach().mean().item()),
+        "weight_min": float(weight.detach().min().item()),
+        "weight_max": float(weight.detach().max().item()),
+        "b_in_pixels": int(inner.detach().sum().item()),
+        "b_out_pixels": int(outer.detach().sum().item()),
+        "target_exterior_conf_mean": _masked_mean(confidence, target_exterior > 0),
+        "target_outer_boundary_conf_mean": _masked_mean(confidence, outer > 0),
+    }
+
+
 def weighted_cross_entropy_loss(
     predict,
     target,

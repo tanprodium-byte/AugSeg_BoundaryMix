@@ -23,9 +23,11 @@ from augseg.utils.utils import AverageMeter, intersectionAndUnion
 from augseg.dataset.augs_ALIA import cut_mix_label_adaptive
 from augseg.utils.loss_helper import compute_unsupervised_loss_by_threshold
 from util.boundary_mix import (
+    boundary_mix_debug_stats,
     cut_mix_label_adaptive_with_mask,
     thresholded_boundary_mix_loss,
 )
+from tools.visualize_boundary_mix_debug import save_boundary_mix_debug
 from util.run_logging import (
     get_or_create_run_id,
     append_csv_row,
@@ -331,6 +333,10 @@ def main(in_args):
     cfg["boundary_mix"].setdefault("use_confidence", True)
     cfg["boundary_mix"].setdefault("normalize_weight", True)
     cfg["boundary_mix"].setdefault("debug", False)
+    cfg["boundary_mix"].setdefault("debug_first_batches", 3)
+    cfg["boundary_mix"].setdefault("vis_debug", False)
+    cfg["boundary_mix"].setdefault("vis_dir", "exp_boundary_debug_vis")
+    cfg["boundary_mix"].setdefault("vis_max_batches", 2)
     
     if not os.path.exists(cfg["log_path"]) and rank == 0:
         os.makedirs(cfg["log_path"])
@@ -771,6 +777,9 @@ def train(
     flag_extra_weak = cfg["trainer"]["unsupervised"].get("flag_extra_weak", False)
     boundary_mix_cfg = cfg.get("boundary_mix", {})
     boundary_mix_enabled = bool(boundary_mix_cfg.get("enabled", False))
+    boundary_mix_debug_enabled = bool(boundary_mix_cfg.get("debug", False))
+    boundary_mix_vis_enabled = bool(boundary_mix_cfg.get("vis_debug", False))
+    boundary_mix_vis_saved = 0
     model.train()
     
     # data loader
@@ -922,6 +931,16 @@ def train(
                     ar_area_ratio_est = (label_u_aug != label_u_before).float().mean().item()
                     del label_u_before
 
+            debug_mixed_image = None
+            if (
+                rank == 0
+                and boundary_mix_enabled
+                and boundary_mix_vis_enabled
+                and mix_source_mask is not None
+                and boundary_mix_vis_saved < int(boundary_mix_cfg.get("vis_max_batches", 2))
+            ):
+                debug_mixed_image = image_u_aug.detach().clone()
+
 
             # effect stats: maxprob quantiles + pseudo ratio (sau cutmix nếu có)
             # CHỈ tính khi thật sự log để tránh chậm (torch.quantile khá tốn)
@@ -967,6 +986,11 @@ def train(
 
             # 5. unsupervised loss
             if boundary_mix_enabled and mix_source_mask is not None:
+                boundary_mix_kernel_size = int(boundary_mix_cfg.get("kernel_size", 5))
+                boundary_mix_gamma_in = float(boundary_mix_cfg.get("gamma_in", 0.7))
+                boundary_mix_gamma_out = float(boundary_mix_cfg.get("gamma_out", 0.3))
+                boundary_mix_use_confidence = bool(boundary_mix_cfg.get("use_confidence", True))
+                boundary_mix_normalize_weight = bool(boundary_mix_cfg.get("normalize_weight", True))
                 unsup_loss, pseduo_high_ratio = thresholded_boundary_mix_loss(
                     pred_u_strong,
                     label_u_aug.detach(),
@@ -974,12 +998,78 @@ def train(
                     mix_source_mask.detach(),
                     thresh=p_threshold,
                     ignore_index=ignore,
-                    kernel_size=int(boundary_mix_cfg.get("kernel_size", 5)),
-                    gamma_in=float(boundary_mix_cfg.get("gamma_in", 0.7)),
-                    gamma_out=float(boundary_mix_cfg.get("gamma_out", 0.3)),
-                    use_confidence=bool(boundary_mix_cfg.get("use_confidence", True)),
-                    normalize_weight=bool(boundary_mix_cfg.get("normalize_weight", True)),
+                    kernel_size=boundary_mix_kernel_size,
+                    gamma_in=boundary_mix_gamma_in,
+                    gamma_out=boundary_mix_gamma_out,
+                    use_confidence=boundary_mix_use_confidence,
+                    normalize_weight=boundary_mix_normalize_weight,
                 )
+
+                do_boundary_debug = (
+                    rank == 0
+                    and boundary_mix_debug_enabled
+                    and (
+                        step < int(boundary_mix_cfg.get("debug_first_batches", 3))
+                        or do_log_now
+                    )
+                )
+                if do_boundary_debug:
+                    bm_stats = boundary_mix_debug_stats(
+                        mix_source_mask.detach(),
+                        logits_u_aug.detach(),
+                        kernel_size=boundary_mix_kernel_size,
+                        gamma_in=boundary_mix_gamma_in,
+                        gamma_out=boundary_mix_gamma_out,
+                        use_confidence=boundary_mix_use_confidence,
+                        normalize_weight=boundary_mix_normalize_weight,
+                    )
+                    logger.info(
+                        "[boundary_mix] epoch=%d step=%d global_iter=%d "
+                        "weight_mean=%.4f weight_min=%.4f weight_max=%.4f "
+                        "B_in_pixels=%d B_out_pixels=%d "
+                        "target_exterior_conf_mean=%.4f target_outer_boundary_conf_mean=%.4f"
+                        % (
+                            epoch,
+                            step,
+                            i_iter,
+                            bm_stats["weight_mean"],
+                            bm_stats["weight_min"],
+                            bm_stats["weight_max"],
+                            bm_stats["b_in_pixels"],
+                            bm_stats["b_out_pixels"],
+                            bm_stats["target_exterior_conf_mean"],
+                            bm_stats["target_outer_boundary_conf_mean"],
+                        )
+                    )
+
+                    if (
+                        boundary_mix_vis_enabled
+                        and debug_mixed_image is not None
+                        and boundary_mix_vis_saved < int(boundary_mix_cfg.get("vis_max_batches", 2))
+                    ):
+                        prefix = "epoch%03d_iter%06d" % (epoch, i_iter)
+                        saved_files = save_boundary_mix_debug(
+                            boundary_mix_cfg.get("vis_dir", "exp_boundary_debug_vis"),
+                            mix_mask=mix_source_mask.detach(),
+                            confidence=logits_u_aug.detach(),
+                            mixed_image=debug_mixed_image,
+                            mixed_label=label_u_aug.detach(),
+                            prediction=pred_u_strong.detach(),
+                            mean=cfg["dataset"].get("mean"),
+                            std=cfg["dataset"].get("std"),
+                            prefix=prefix,
+                            kernel_size=boundary_mix_kernel_size,
+                            gamma_in=boundary_mix_gamma_in,
+                            gamma_out=boundary_mix_gamma_out,
+                            use_confidence=boundary_mix_use_confidence,
+                            normalize_weight=boundary_mix_normalize_weight,
+                            max_items=1,
+                        )
+                        boundary_mix_vis_saved += 1
+                        logger.info(
+                            "[boundary_mix] saved %d debug visualization PNGs under %s"
+                            % (len(saved_files), boundary_mix_cfg.get("vis_dir", "exp_boundary_debug_vis"))
+                        )
             else:
                 unsup_loss, pseduo_high_ratio = compute_unsupervised_loss_by_threshold(
                             pred_u_strong, label_u_aug.detach(),
