@@ -1,0 +1,117 @@
+# Minimal 1-GPU checkpoint/resume smoke config.
+# tools/smoke_checkpoint_resume.sh creates one-line split files under
+# exps/debug_checkpoint_resume/pascal_smoke before launching train_semi.py.
+dataset:
+  type: pascal_semi
+  train:
+    data_root: ./data/VOC2012
+    data_list: ./exps/debug_checkpoint_resume/pascal_smoke/labeled.txt
+    batch_size: 1
+    flip: False
+    rand_resize: [1.0, 1.0]
+    resize_base_size: 129
+    crop:
+      type: rand
+      size: [129, 129]
+    strong_aug:
+      num_augs: 1
+      flag_use_random_num_sampling: False
+  val:
+    data_root: ./data/VOC2012
+    data_list: ./exps/debug_checkpoint_resume/pascal_smoke/val.txt
+    batch_size: 1
+    crop:
+      type: center
+      size: [129, 129]
+  n_sup: 10581
+  workers: 0
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  ignore_label: 255
+
+trainer:
+  epochs: 1
+  sup_only_epoch: 0
+  evaluate_student: True
+  optimizer:
+    type: SGD
+    kwargs:
+      lr: 0.000125
+      momentum: 0.9
+      weight_decay: 0.0001
+  lr_scheduler:
+    mode: poly
+    kwargs:
+      power: 0.9
+  unsupervised:
+    flag_extra_weak: False
+    threshold: 0.95
+    loss_weight: 1.0
+    use_cutmix: False
+    use_cutmix_adaptive: False
+    use_cutmix_trigger_prob: 0.0
+
+saver:
+  snapshot_dir: ../../exp_smoke_checkpoint_hf
+  pretrain: ''
+  use_tb: False
+
+checkpoint:
+  auto_resume: True
+  save_latest: True
+  save_best: True
+
+hf:
+  enabled: true
+  repo_id: tanprodium/augseg-checkpoints
+  repo_type: model
+  auto_download: true
+  auto_upload: true
+  upload_every_epoch: true
+  keep_only_latest: true
+  bundle_name: latest.tar.gz
+  path_in_repo: augseg_smoke/latest.tar.gz
+  squash_after_upload: false
+
+criterion:
+  type: CELoss
+  kwargs:
+    use_weight: False
+
+net:
+  num_classes: 21
+  sync_bn: False
+  ema_decay: 0.999
+  encoder:
+    type: augseg.models.resnet.resnet101
+    pretrain:
+    kwargs:
+      pretrained: False
+      zero_init_residual: True
+      multi_grid: True
+      replace_stride_with_dilation: [False, False, True]
+  decoder:
+    type: augseg.models.decoder.dec_deeplabv3_plus
+    kwargs:
+      inner_planes: 256
+      low_conv_planes: 48
+      dilations: [6, 12, 18]
+
+wandb:
+  enable: False
+  log_every: 1
+
+run:
+  name: smoke_checkpoint_resume
+  log_every: 1
+
+
+boundary_mix:
+  enabled: false
+  mode: fixed
+  kernel_size: 5
+  gamma_in: 0.7
+  gamma_out: 0.3
+  use_confidence: true
+  normalize_weight: true
+  debug: false
